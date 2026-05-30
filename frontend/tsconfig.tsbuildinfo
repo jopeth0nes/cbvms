@@ -1,1 +1,0 @@
-{"root":["./src/app.tsx","./src/main.tsx","./src/vite-env.d.ts","./src/api/cameras.ts","./src/components/appshell.tsx","./src/components/cameraconfiguration.tsx","./src/components/toast.tsx","./src/pages/livemonitor.tsx","./src/pages/settings.tsx","./src/types/camera.ts"],"version":"5.6.3"}

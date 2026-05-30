@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -18,12 +19,36 @@ _global_model = None
 _recognizer_instance = None
 
 
+def download_yolo_model(model_path: Path) -> bool:
+    """Download YOLOv8n model from Ultralytics if not present."""
+    if model_path.exists():
+        return True
+    
+    try:
+        print(f"[CBVMS] Downloading YOLOv8n model to {model_path}...")
+        url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt"
+        urllib.request.urlretrieve(url, model_path)
+        print(f"[CBVMS] Successfully downloaded YOLOv8n model")
+        return True
+    except Exception as exc:
+        print(f"[CBVMS] Failed to download YOLOv8n model: {exc}")
+        return False
+
+
 def get_model() -> YOLO:
     global _global_model
     if _global_model is None:
         root = Path(__file__).resolve().parent.parent
         model_path = root / "models" / "yolov8n.pt"
         model_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        if not model_path.exists():
+            if not download_yolo_model(model_path):
+                raise FileNotFoundError(
+                    f"YOLO model not found at {model_path} and download failed. "
+                    "Please download manually or check internet connection."
+                )
+        
         _global_model = YOLO(str(model_path))
     return _global_model
 
@@ -204,11 +229,24 @@ class Detector:
             path = root / path
         path.parent.mkdir(parents=True, exist_ok=True)
         self.model_path = path
-        self.model = YOLO(str(self.model_path))
-        global _global_model
-        _global_model = self.model
-        model_name = getattr(self.model, "model_name", None) or path.name
-        print(f"[CBVMS] YOLO model loaded: {model_name}")
+        
+        if not path.exists():
+            if not download_yolo_model(path):
+                raise FileNotFoundError(
+                    f"YOLO model not found at {path} and download failed. "
+                    "Please download manually or check internet connection."
+                )
+        
+        try:
+            self.model = YOLO(str(self.model_path))
+            global _global_model
+            _global_model = self.model
+            model_name = getattr(self.model, "model_name", None) or path.name
+            print(f"[CBVMS] YOLO model loaded: {model_name}")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load YOLO model from {self.model_path}: {exc}"
+            ) from exc
 
     def detect_persons(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
         return detect_persons(frame)

@@ -20,9 +20,7 @@ __pycache__/
 data/
 *.db
 
-# Web frontend
-frontend/node_modules/
-frontend/dist/
+
 
 # OS / editor
 .DS_Store

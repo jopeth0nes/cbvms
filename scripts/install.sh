@@ -44,6 +44,32 @@ if ! python -c "import tkinter; import customtkinter" 2>/dev/null; then
   exit 1
 fi
 
+# Download YOLO model if not present
+echo "Checking for YOLO model..."
+models_dir="$ROOT/models"
+mkdir -p "$models_dir"
+if [ ! -f "$models_dir/yolov8n.pt" ]; then
+  echo "Downloading YOLOv8n model..."
+  python -c "
+import urllib.request
+import sys
+try:
+    url = 'https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt'
+    urllib.request.urlretrieve(url, '$models_dir/yolov8n.pt')
+    print('YOLO model downloaded successfully')
+except Exception as e:
+    print(f'Failed to download model: {e}')
+    sys.exit(1)
+"
+  if [ $? -eq 0 ]; then
+    echo "YOLO model downloaded successfully"
+  else
+    echo "Warning: Failed to download YOLO model. It will be downloaded on first run."
+  fi
+else
+  echo "YOLO model already present"
+fi
+
 echo "Core dependencies installed."
 echo "Run the app:  ./scripts/run.sh"
 echo "Or:          source .venv/bin/activate && python main.py"

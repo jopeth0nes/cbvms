@@ -26,6 +26,7 @@ from core.recognizer import FACE_RECOGNITION_AVAILABLE, Recognizer
 from core.torso_detection import draw_detections
 from core.violation_engine import ViolationEngine
 from database.db_manager import CBVMSDatabase
+from ui.camera_feed import CameraFeed
 from ui.enrollment import EnrollmentPanel
 from ui.settings import SettingsPanel
 from ui.violation_log import ViolationLogPanel
@@ -61,6 +62,7 @@ BGR_DANGER = (68, 68, 239)
 MAX_ALERTS = 50
 DISPLAY_WIDTH = 960
 DISPLAY_HEIGHT = 540
+FEED_FPS = 15  # Reduced from default to prevent image garbage collection issues
 
 
 def _make_no_camera_frame(width: int, height: int) -> np.ndarray:
@@ -85,8 +87,13 @@ class CBVMSDashboard(ctk.CTk):
         self._detection_tracker = DetectionStateTracker()
         self._feed_job: str | None = None
         self._clock_job: str | None = None
-        self._video_photo: ctk.CTkImage | None = None
         self._fps_times: deque[float] = deque(maxlen=30)
+        self._last_person_count = 0
+        self._person_counter = 0
+        self._last_detections: list[dict] = []
+        self._overlay_detections: list[dict] = []
+        self._overlay_lock = threading.Lock()
+        self._pipeline_frame_counter = 0
         self._last_person_count = 0
         self._person_counter = 0
         self._last_detections: list[dict] = []
@@ -132,7 +139,7 @@ class CBVMSDashboard(ctk.CTk):
         self._camera_resolution_setting = (1280, 720)
         self._fps_cap_setting = 30
         self._load_camera_preference()
-        self._feed_interval_ms = max(16, int(1000 / float(self._fps_cap_setting)))
+        self._feed_interval_ms = max(50, int(1000 / FEED_FPS))  # Use slower frame rate for display
 
         self._build_ui()
         self._build_menubar()
@@ -289,10 +296,14 @@ class CBVMSDashboard(ctk.CTk):
         self._stats_row = self._build_stats_row(self._live_frame)
         self._stats_row.grid(row=0, column=0, sticky="ew", pady=(0, PADDING))
 
-        # Camera Label (replacing feed_card/video_canvas)
-        self.camera_label = ctk.CTkLabel(self._live_frame, text="")
-        self.camera_label.configure(width=640, height=480)
-        self.camera_label.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
+        # Camera Feed (using new CameraFeed component)
+        self.camera_feed = CameraFeed(
+            self._live_frame,
+            width=DISPLAY_WIDTH,
+            height=DISPLAY_HEIGHT,
+            bg_color=COLOR_BG
+        )
+        self.camera_feed.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
 
         # Overlay for camera errors (non-blocking).
         self._no_camera_overlay = ctk.CTkFrame(
@@ -706,6 +717,8 @@ class CBVMSDashboard(ctk.CTk):
             try:
                 self._no_camera_overlay.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
                 self._no_camera_overlay.tkraise()
+                # Stop camera feed updates when no camera
+                self.camera_feed.stop_updates()
             except Exception:
                 pass
             try:
@@ -725,6 +738,10 @@ class CBVMSDashboard(ctk.CTk):
         else:
             try:
                 self._no_camera_overlay.grid_remove()
+                # Ensure camera feed is visible and running
+                self.camera_feed.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
+                if not self.camera_feed._is_running:
+                    self.camera_feed.start_updates(self._feed_interval_ms)
             except Exception:
                 pass
         if frame is not None:
@@ -753,6 +770,8 @@ class CBVMSDashboard(ctk.CTk):
             self._camera_spinner.start()
         except Exception:
             pass
+        
+        camera_error = None
         if self._camera_source_url:
             self._camera = CameraCapture(
                 source_url=self._camera_source_url,
@@ -767,13 +786,20 @@ class CBVMSDashboard(ctk.CTk):
                 height=self._camera_resolution_setting[1],
                 fps_cap=self._fps_cap_setting,
             )
+        
         if self._camera.open():
             self._pipeline_frame_counter = 0
             self._live_worker.start()
             self._status_camera.configure(text="Camera Active", text_color=COLOR_SAFE)
             return
 
-        self._status_camera.configure(text="No Camera", text_color=COLOR_DANGER)
+        camera_error = self._camera.last_error if self._camera else "Unknown error"
+        print(f"[CBVMS] Camera initialization failed: {camera_error}")
+        self._status_camera.configure(text=f"No Camera: {camera_error}", text_color=COLOR_DANGER)
+        
+        if self._camera_retry_count == 0:
+            show_toast(self, f"Camera error: {camera_error}", type="error", duration=4000)
+        
         if self._camera_retry_count < 8:
             self._camera_retry_count += 1
             self.after(1500, self._deferred_start_camera)
@@ -787,11 +813,16 @@ class CBVMSDashboard(ctk.CTk):
         def _load() -> None:
             try:
                 detector = Detector()
+                err = None
+            except FileNotFoundError as exc:
+                detector = None
+                err = f"Model not found: {exc}"
+            except RuntimeError as exc:
+                detector = None
+                err = f"Model load error: {exc}"
             except Exception as exc:
                 detector = None
-                err = str(exc)
-            else:
-                err = None
+                err = f"Unexpected error: {exc}"
 
             def _apply() -> None:
                 self._detector_loading = False
@@ -801,7 +832,10 @@ class CBVMSDashboard(ctk.CTk):
                 else:
                     self._detector = None
                     self._status_persons.configure(text="Persons: detector offline")
-                    if err and self._camera and self._camera.is_open:
+                    if err:
+                        print(f"[CBVMS] Detector initialization failed: {err}")
+                        show_toast(self, f"Detector error: {err}", type="error", duration=5000)
+                    if self._camera and self._camera.is_open:
                         self._status_camera.configure(
                             text=f"Camera OK — Detector offline",
                             text_color=COLOR_WARNING,
@@ -821,6 +855,20 @@ class CBVMSDashboard(ctk.CTk):
     def _schedule_feed_update(self) -> None:
         self._feed_job = self.after(self._feed_interval_ms, self._update_feed)
 
+    def _process_detection_pipeline(self, frame: np.ndarray) -> None:
+        """Process frame through detection pipeline (separate from display)."""
+        try:
+            self._pipeline_frame_counter += 1
+            
+            # Only offer frame to worker if detector is available
+            if self._detector is not None:
+                self._live_worker.offer_frame(frame, self._pipeline_frame_counter)
+            else:
+                # Update detection info without detections
+                self._refresh_detection_info_panel([])
+        except Exception as exc:
+            print(f"[CBVMS] Error in detection pipeline: {exc}")
+
     def _update_feed(self) -> None:
         if not self.winfo_exists():
             return
@@ -830,15 +878,28 @@ class CBVMSDashboard(ctk.CTk):
             self._update_camera_status(frame)
 
             if self._active_nav == "live":
-                self._render_live_frame(frame)
+                # Update the camera feed with the new frame
+                if frame is not None:
+                    self.camera_feed.update_frame(frame)
+                    self._process_detection_pipeline(frame)
+                else:
+                    # Let the camera feed handle the placeholder
+                    pass
+                    
+                # Start camera feed updates if not running
+                if not self.camera_feed._is_running:
+                    self.camera_feed.start_updates(self._feed_interval_ms)
+                    
             elif self._active_nav == "enrollment" and self._enrollment_panel is not None:
                 self._enrollment_panel.update_preview(frame)
         except tk.TclError as exc:
+            print(f"[CBVMS] TclError in feed update: {exc}")
             self._status_camera.configure(
                 text=f"Display error: {exc}",
                 text_color=COLOR_DANGER,
             )
         except Exception as exc:
+            print(f"[CBVMS] Exception in feed update: {exc}")
             self._status_camera.configure(
                 text=f"Feed error: {exc}",
                 text_color=COLOR_DANGER,
@@ -860,43 +921,6 @@ class CBVMSDashboard(ctk.CTk):
 
         if self.winfo_exists():
             self.after(0, _apply)
-
-    def _paint_video_frame(self, frame_bgr: np.ndarray) -> None:
-        """Draw BGR frame on the CTk label (must run on main/UI thread)."""
-        display = cv2.resize(
-            frame_bgr,
-            (DISPLAY_WIDTH, DISPLAY_HEIGHT),
-            interpolation=cv2.INTER_LINEAR,
-        )
-        rgb = np.ascontiguousarray(cv2.cvtColor(display, cv2.COLOR_BGR2RGB))
-        pil_image = Image.fromarray(rgb)
-
-        photo = ctk.CTkImage(light_image=pil_image, dark_image=pil_image, size=(DISPLAY_WIDTH, DISPLAY_HEIGHT))
-        self._video_photo = photo  # keep reference to prevent garbage collection
-        self.camera_label.configure(image=photo)
-
-    def _render_live_frame(self, frame: np.ndarray | None = None) -> None:
-        """Display lane only — AI runs in LiveDetectionWorker."""
-        t0 = time.perf_counter()
-
-        if frame is None:
-            display = _make_no_camera_frame(DISPLAY_WIDTH, DISPLAY_HEIGHT)
-        else:
-            self._pipeline_frame_counter += 1
-            self._live_worker.offer_frame(frame, self._pipeline_frame_counter)
-            with self._overlay_lock:
-                detections = list(self._overlay_detections)
-            display = self._draw_detections(frame, detections)
-
-        self._paint_video_frame(display)
-
-        elapsed = time.perf_counter() - t0
-        if elapsed > 0:
-            self._fps_times.append(elapsed)
-        if self._fps_times:
-            avg = sum(self._fps_times) / len(self._fps_times)
-            ui_fps = 1.0 / avg if avg > 0 else 0.0
-            self._status_fps.configure(text=f"FPS: {ui_fps:.1f}")
 
     def _draw_detections(self, frame: np.ndarray, detections: list[dict]) -> np.ndarray:
         if not detections:
@@ -1027,7 +1051,7 @@ class CBVMSDashboard(ctk.CTk):
                 text="✓ No violations",
                 font=body_small_font(),
                 text_color=COLOR_SAFE,
-                fg_color="#10B98122",
+                fg_color="transparent",
                 corner_radius=8,
             ).pack(anchor="w", padx=0, pady=2)
             return
@@ -1037,7 +1061,7 @@ class CBVMSDashboard(ctk.CTk):
                 text=f"✗ {self._format_violation_label(code)}",
                 font=body_small_font(),
                 text_color=COLOR_DANGER,
-                fg_color="#EF444422",
+                fg_color="transparent",
                 corner_radius=8,
             ).pack(anchor="w", padx=0, pady=2)
 
@@ -1302,6 +1326,7 @@ class CBVMSDashboard(ctk.CTk):
         self._cancel_jobs()
         self._stop_camera()
         self._live_worker.stop()
+        self.camera_feed.cleanup()
         self.destroy()
 
 
