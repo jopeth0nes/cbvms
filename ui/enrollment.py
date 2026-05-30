@@ -10,14 +10,6 @@ from typing import TYPE_CHECKING, Callable
 import cv2
 import customtkinter as ctk
 import numpy as np
-
-try:
-    import face_recognition  # type: ignore
-
-    FACE_RECOGNITION_AVAILABLE = True
-except Exception:
-    face_recognition = None  # type: ignore
-    FACE_RECOGNITION_AVAILABLE = False
 from PIL import Image, ImageTk
 
 from ui.components import (
@@ -110,7 +102,7 @@ class EnrollmentPanel(ctk.CTkFrame):
         tree_wrap.grid_columnconfigure(0, weight=1)
 
         self._configure_tree_style()
-        columns = ("name", "student_id", "course", "year_level", "enrolled_at")
+        columns = ("name", "student_id", "course", "year_and_section", "gender", "enrolled_at")
         self._tree = ttk.Treeview(
             tree_wrap,
             columns=columns,
@@ -122,10 +114,11 @@ class EnrollmentPanel(ctk.CTkFrame):
             "name": "Name",
             "student_id": "Student ID",
             "course": "Course",
-            "year_level": "Year Level",
+            "year_and_section": "Year & Section",
+            "gender": "Gender",
             "enrolled_at": "Date Enrolled",
         }
-        widths = {"name": 140, "student_id": 90, "course": 100, "year_level": 80, "enrolled_at": 110}
+        widths = {"name": 130, "student_id": 90, "course": 90, "year_and_section": 100, "gender": 65, "enrolled_at": 100}
         for col in columns:
             self._tree.heading(col, text=headings[col])
             self._tree.column(col, width=widths[col], anchor="w")
@@ -216,7 +209,7 @@ class EnrollmentPanel(ctk.CTkFrame):
             ("Full Name", "name"),
             ("Student ID", "student_id"),
             ("Course", "course"),
-            ("Year Level", "year_level"),
+            ("Year and Section", "year_and_section"),
         ]
         self._entries: dict[str, ctk.CTkEntry] = {}
         for row, (label, key) in enumerate(fields):
@@ -226,6 +219,17 @@ class EnrollmentPanel(ctk.CTkFrame):
             entry = ctk.CTkEntry(form)
             entry.grid(row=row, column=1, sticky="ew", pady=6)
             self._entries[key] = entry
+
+        # Gender selector
+        ctk.CTkLabel(form, text="Gender", font=body_font(12), text_color=COLOR_TEXT_MUTED).grid(
+            row=4, column=0, sticky="w", pady=6, padx=(0, 12)
+        )
+        self._gender_var = ctk.StringVar(value="Male")
+        ctk.CTkSegmentedButton(
+            form,
+            values=["Male", "Female"],
+            variable=self._gender_var,
+        ).grid(row=4, column=1, sticky="ew", pady=6)
 
         preview_card = ctk.CTkFrame(
             right,
@@ -357,7 +361,8 @@ class EnrollmentPanel(ctk.CTkFrame):
                     student.get("name", ""),
                     student.get("student_id", ""),
                     student.get("course", "") or "—",
-                    student.get("year_level", "") or "—",
+                    student.get("year_and_section", "") or "—",
+                    student.get("gender", "") or "—",
                     enrolled or "—",
                 ),
             )
@@ -450,9 +455,10 @@ class EnrollmentPanel(ctk.CTkFrame):
         name = self._entries["name"].get().strip()
         student_id = self._entries["student_id"].get().strip()
         course = self._entries["course"].get().strip()
-        year_level = self._entries["year_level"].get().strip()
+        year_and_section = self._entries["year_and_section"].get().strip()
+        gender = self._gender_var.get()
 
-        if not all([name, student_id, course, year_level]):
+        if not all([name, student_id, course, year_and_section]):
             self._set_status("Please fill in all fields.", error=True)
             return
 
@@ -460,10 +466,9 @@ class EnrollmentPanel(ctk.CTkFrame):
             self._set_status(f"Student ID '{student_id}' is already enrolled.", error=True)
             return
 
-        if not FACE_RECOGNITION_AVAILABLE or face_recognition is None:
+        if self.recognizer is None:
             self._set_status(
-                "Face recognition is not installed. On Windows install CMake and "
-                "Visual Studio C++ Build Tools, then: pip install -r requirements-face.txt",
+                "Face recognition not ready. Please wait for the model to load.",
                 error=True,
             )
             return
@@ -473,26 +478,20 @@ class EnrollmentPanel(ctk.CTkFrame):
             self._set_status("Camera unavailable. Start preview when the camera is active.", error=True)
             return
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        locations = face_recognition.face_locations(rgb)
-        if not locations:
+        self._set_status("Detecting face…")
+        embedding, box = self.recognizer.encode_face(frame)
+        if embedding is None or box is None:
             self._set_status(
-                "No face detected. Adjust position and try again.",
+                "No face detected. Look directly at the camera and try again.",
                 error=True,
             )
             return
 
-        encodings = face_recognition.face_encodings(rgb, locations)
-        if not encodings:
-            self._set_status(
-                "No face detected. Adjust position and try again.",
-                error=True,
-            )
-            return
+        encoding_blob = pickle.dumps(embedding)
 
-        encoding_blob = pickle.dumps(encodings[0])
-        top, right, bottom, left = locations[0]
-        face_crop = frame[top:bottom, left:right]
+        # Crop face photo using MTCNN box [x1, y1, x2, y2]
+        x1, y1, x2, y2 = [max(0, int(v)) for v in box]
+        face_crop = frame[y1:y2, x1:x2]
         if face_crop.size == 0:
             face_crop = frame
         ok, buf = cv2.imencode(".jpg", face_crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
@@ -505,7 +504,8 @@ class EnrollmentPanel(ctk.CTkFrame):
                 student_id=student_id,
                 name=name,
                 course=course,
-                year_level=year_level,
+                year_and_section=year_and_section,
+                gender=gender,
                 encoding=encoding_blob,
                 photo=buf.tobytes(),
             )
@@ -516,7 +516,8 @@ class EnrollmentPanel(ctk.CTkFrame):
         self._clear_form()
         self._set_status("Student enrolled successfully", success=True)
         self._reload_students()
-        self.recognizer.load_known_faces()
+        if self.recognizer is not None:
+            self.recognizer.load_known_faces()
 
     def _delete_selected(self) -> None:
         if self._selected_pk is None:
@@ -537,7 +538,8 @@ class EnrollmentPanel(ctk.CTkFrame):
             self._selected_photo_label.configure(image=None, text="Select a student to view photo")
             self._set_status("Student deleted.", success=True)
             self._reload_students()
-            self.recognizer.load_known_faces()
+            if self.recognizer is not None:
+                self.recognizer.load_known_faces()
         else:
             self._set_status("Delete failed.", error=True)
 

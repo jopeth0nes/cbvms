@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS students (
     student_id TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     course TEXT,
-    year_level TEXT,
+    year_and_section TEXT,
+    gender TEXT DEFAULT 'Unknown',
     encoding BLOB,
     photo BLOB,
     enrolled_at TEXT NOT NULL DEFAULT (datetime('now'))

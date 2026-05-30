@@ -6,10 +6,14 @@ import colorsys
 from pathlib import Path
 from typing import Callable
 
+from typing import TYPE_CHECKING
+
 import customtkinter as ctk
 
-from core.recognizer import Recognizer
-from core.violation_engine import ViolationEngine
+if TYPE_CHECKING:
+    from core.recognizer import Recognizer
+    from core.violation_engine import ViolationEngine
+
 from database.db_manager import CBVMSDatabase
 from ui.camera_configuration import CameraConfigurationSection
 from ui.components import (
@@ -48,8 +52,8 @@ class SettingsPanel(ctk.CTkFrame):
         master,
         *,
         database: CBVMSDatabase,
-        recognizer: Recognizer,
-        violation_engine: ViolationEngine,
+        recognizer: "Recognizer | None",
+        violation_engine: "ViolationEngine | None",
         username: str,
         get_detector_loaded: Callable[[], bool],
         apply_camera_settings: Callable[[int, tuple[int, int], int], None],

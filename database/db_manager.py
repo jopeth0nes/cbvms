@@ -33,6 +33,12 @@ class CBVMSDatabase:
         with self.connect() as conn:
             for ddl in ALL_TABLES:
                 conn.execute(ddl)
+            # Migrations for existing databases
+            cols = [row[1] for row in conn.execute("PRAGMA table_info(students)").fetchall()]
+            if "gender" not in cols:
+                conn.execute("ALTER TABLE students ADD COLUMN gender TEXT DEFAULT 'Unknown'")
+            if "year_level" in cols and "year_and_section" not in cols:
+                conn.execute("ALTER TABLE students RENAME COLUMN year_level TO year_and_section")
             conn.commit()
         self._seed_default_admin()
 
@@ -63,7 +69,7 @@ class CBVMSDatabase:
         with self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id, student_id, name, course, year_level, encoding, photo, enrolled_at
+                SELECT id, student_id, name, course, year_and_section, gender, encoding, photo, enrolled_at
                 FROM students
                 ORDER BY name COLLATE NOCASE
                 """
@@ -74,7 +80,7 @@ class CBVMSDatabase:
         with self.connect() as conn:
             return conn.execute(
                 """
-                SELECT id, student_id, name, course, year_level, encoding, photo, enrolled_at
+                SELECT id, student_id, name, course, year_and_section, gender, encoding, photo, enrolled_at
                 FROM students WHERE id = ?
                 """,
                 (student_pk,),
@@ -93,21 +99,23 @@ class CBVMSDatabase:
         student_id: str,
         name: str,
         course: str,
-        year_level: str,
+        year_and_section: str,
         encoding: bytes,
         photo: bytes,
+        gender: str = "Unknown",
     ) -> int:
         with self.connect() as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO students (student_id, name, course, year_level, encoding, photo)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO students (student_id, name, course, year_and_section, gender, encoding, photo)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     student_id.strip(),
                     name.strip(),
                     course.strip(),
-                    year_level.strip(),
+                    year_and_section.strip(),
+                    gender.strip() or "Unknown",
                     encoding,
                     photo,
                 ),
