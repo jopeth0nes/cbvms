@@ -1,0 +1,189 @@
+"""CBVMS login screen."""
+
+from __future__ import annotations
+
+import sys
+from typing import Callable
+
+import customtkinter as ctk
+
+from auth.auth_manager import AuthManager
+from ui.components import (
+    COLOR_ACCENT,
+    COLOR_ACCENT_HOVER,
+    COLOR_BG,
+    COLOR_BORDER,
+    COLOR_DANGER,
+    COLOR_SURFACE,
+    COLOR_TEXT_MUTED,
+    CORNER_RADIUS,
+    PADDING,
+    PADDING_LG,
+    apply_cbvms_theme,
+    body_font,
+    heading_font,
+)
+
+
+class CBVMSLoginWindow(ctk.CTk):
+    WIDTH = 420
+    HEIGHT = 520
+
+    def __init__(self, auth_manager: AuthManager, on_success: Callable[[str], None]) -> None:
+        super().__init__()
+        self._auth = auth_manager
+        self._on_success = on_success
+        self._password_visible = False
+
+        apply_cbvms_theme()
+        self._configure_window()
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _configure_window(self) -> None:
+        self.title("CBVMS — Login")
+        self.geometry(f"{self.WIDTH}x{self.HEIGHT}")
+        self.minsize(self.WIDTH, self.HEIGHT)
+        self.maxsize(self.WIDTH, self.HEIGHT)
+        self.configure(fg_color=COLOR_BG)
+        self.resizable(False, False)
+        self._center_on_screen()
+
+    def _center_on_screen(self) -> None:
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = (sw - self.WIDTH) // 2
+        y = (sh - self.HEIGHT) // 2
+        self.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
+
+    def _build_ui(self) -> None:
+        container = ctk.CTkFrame(self, fg_color="transparent")
+        container.pack(fill="both", expand=True, padx=PADDING_LG, pady=PADDING_LG)
+
+        ctk.CTkLabel(
+            container,
+            text="Computer Based Vision\nMonitoring System",
+            font=heading_font(20),
+            text_color=COLOR_ACCENT,
+            justify="center",
+        ).pack(pady=(8, 4))
+
+        ctk.CTkLabel(
+            container,
+            text="CBVMS — Campus Entrance Monitoring",
+            font=body_font(13),
+            text_color=COLOR_TEXT_MUTED,
+        ).pack(pady=(0, PADDING_LG))
+
+        form = ctk.CTkFrame(
+            container,
+            fg_color=COLOR_SURFACE,
+            corner_radius=CORNER_RADIUS,
+            border_width=1,
+            border_color=COLOR_BORDER,
+        )
+        form.pack(fill="x", pady=(0, PADDING))
+
+        inner = ctk.CTkFrame(form, fg_color="transparent")
+        inner.pack(fill="x", padx=PADDING, pady=PADDING)
+
+        ctk.CTkLabel(
+            inner,
+            text="Username",
+            font=body_font(12),
+            text_color=COLOR_TEXT_MUTED,
+            anchor="w",
+        ).pack(fill="x")
+        self.username_entry = ctk.CTkEntry(
+            inner,
+            placeholder_text="Enter username",
+            height=40,
+            corner_radius=CORNER_RADIUS,
+            border_color=COLOR_BORDER,
+            fg_color=COLOR_BG,
+        )
+        self.username_entry.pack(fill="x", pady=(4, PADDING))
+
+        ctk.CTkLabel(
+            inner,
+            text="Password",
+            font=body_font(12),
+            text_color=COLOR_TEXT_MUTED,
+            anchor="w",
+        ).pack(fill="x")
+
+        pwd_row = ctk.CTkFrame(inner, fg_color="transparent")
+        pwd_row.pack(fill="x", pady=(4, 0))
+
+        self.password_entry = ctk.CTkEntry(
+            pwd_row,
+            placeholder_text="Enter password",
+            height=40,
+            corner_radius=CORNER_RADIUS,
+            border_color=COLOR_BORDER,
+            fg_color=COLOR_BG,
+            show="•",
+        )
+        self.password_entry.pack(side="left", fill="x", expand=True)
+
+        self.toggle_btn = ctk.CTkButton(
+            pwd_row,
+            text="Show",
+            width=64,
+            height=40,
+            corner_radius=CORNER_RADIUS,
+            fg_color=COLOR_BORDER,
+            hover_color=COLOR_ACCENT_HOVER,
+            command=self._toggle_password,
+        )
+        self.toggle_btn.pack(side="right", padx=(8, 0))
+
+        self.login_btn = ctk.CTkButton(
+            container,
+            text="Login",
+            height=44,
+            corner_radius=CORNER_RADIUS,
+            fg_color=COLOR_ACCENT,
+            hover_color=COLOR_ACCENT_HOVER,
+            font=body_font(14),
+            command=self._attempt_login,
+        )
+        self.login_btn.pack(fill="x", pady=(PADDING, 8))
+
+        self.error_label = ctk.CTkLabel(
+            container,
+            text="",
+            font=body_font(12),
+            text_color=COLOR_DANGER,
+        )
+        self.error_label.pack(fill="x")
+
+        self.bind("<Return>", lambda _e: self._attempt_login())
+        self.username_entry.focus_set()
+
+    def _toggle_password(self) -> None:
+        self._password_visible = not self._password_visible
+        self.password_entry.configure(show="" if self._password_visible else "•")
+        self.toggle_btn.configure(text="Hide" if self._password_visible else "Show")
+
+    def _attempt_login(self) -> None:
+        username = self.username_entry.get().strip()
+        password = self.password_entry.get()
+
+        if self._auth.verify_login(username, password):
+            self.error_label.configure(text="")
+            self.withdraw()
+            self._on_success(username)
+            self.destroy()
+            return
+
+        self.error_label.configure(text="Invalid username or password.")
+
+    def _on_close(self) -> None:
+        sys.exit(0)
+
+
+def run_login(auth_manager: AuthManager, on_success: Callable[[str], None]) -> None:
+    app = CBVMSLoginWindow(auth_manager, on_success)
+    app.mainloop()
