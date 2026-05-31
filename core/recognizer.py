@@ -37,7 +37,21 @@ class FaceRecognizer:
         self._resnet = None
         self._known: list[tuple[dict, np.ndarray]] = []  # (student_row, embedding)
         self._models_loaded = False
+        self.threshold: float = MATCH_THRESHOLD  # runtime-adjustable match sensitivity
         self.load_known_faces()
+
+    @property
+    def sensitivity_label(self) -> str:
+        if self.threshold <= 0.45:
+            return "Very Strict"
+        elif self.threshold <= 0.55:
+            return "Strict"
+        elif self.threshold <= 0.65:
+            return "Balanced"
+        elif self.threshold <= 0.75:
+            return "Lenient"
+        else:
+            return "Very Lenient"
 
     # ------------------------------------------------------------------
     # Model loading (lazy)
@@ -219,7 +233,7 @@ class FaceRecognizer:
                 if known_snapshot:
                     distances = [_cosine_distance(emb, k_emb) for _, k_emb in known_snapshot]
                     best_idx = int(np.argmin(distances))
-                    if distances[best_idx] < MATCH_THRESHOLD:
+                    if distances[best_idx] < self.threshold:
                         student = known_snapshot[best_idx][0]
                         name = student.get("name", "Unknown")
                         sid = student.get("student_id", "")

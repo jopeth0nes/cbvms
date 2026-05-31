@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import colorsys
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -14,6 +15,7 @@ import customtkinter as ctk
 from core.trainer import MODULES
 
 if TYPE_CHECKING:
+    from core.notifier import Notifier
     from core.recognizer import Recognizer
     from core.trainer import ViolationTrainer
     from core.violation_engine import LiveViolationChecker, ViolationEngine
@@ -35,10 +37,16 @@ from ui.components import (
     PADDING,
     ROW_STRIPE_EVEN,
     body_small_font,
+    heading_font,
     panel_title_font,
     section_title_font,
     show_toast,
 )
+
+# Dark tinted badge backgrounds for the sensitivity indicator (no components.py equivalent).
+_SENS_BG_STRICT = "#15233D"    # dark blue
+_SENS_BG_BALANCED = "#12281F"  # dark green
+_SENS_BG_LENIENT = "#2E2310"   # dark orange
 
 
 def _hex_from_hsv(h: int, s: int, v: int) -> str:
@@ -64,6 +72,7 @@ class SettingsPanel(ctk.CTkFrame):
         on_camera_source_connected: Callable[[dict], None] | None = None,
         trainer: "ViolationTrainer | None" = None,
         checker: "LiveViolationChecker | None" = None,
+        notifier: "Notifier | None" = None,
         **kwargs,
     ) -> None:
         super().__init__(master, fg_color=COLOR_BG, **kwargs)
@@ -72,6 +81,7 @@ class SettingsPanel(ctk.CTkFrame):
         self.violation_engine = violation_engine
         self.trainer = trainer
         self.checker = checker
+        self.notifier = notifier
         self.username = username
         self.get_detector_loaded = get_detector_loaded
         self.apply_camera_settings = apply_camera_settings
@@ -100,6 +110,7 @@ class SettingsPanel(ctk.CTkFrame):
         row = self._camera_configuration_section(scroll, row=row)
         row = self._recognition_section(scroll, row=row)
         row = self._violation_section(scroll, row=row)
+        row = self._notifications_section(scroll, row=row)
         row = self._model_status_section(scroll, row=row)
         row = self._admin_section(scroll, row=row)
 
@@ -125,73 +136,152 @@ class SettingsPanel(ctk.CTkFrame):
         section.grid(row=row, column=0, sticky="ew", padx=PADDING, pady=(0, 12))
         return row + 1
 
+    @staticmethod
+    def _sens_badge_style(label: str) -> tuple[str, str]:
+        """Return (bg, fg) for a sensitivity label."""
+        if label in ("Very Strict", "Strict"):
+            return _SENS_BG_STRICT, COLOR_ACCENT
+        if label == "Balanced":
+            return _SENS_BG_BALANCED, COLOR_SAFE
+        return _SENS_BG_LENIENT, COLOR_WARNING
+
+    @staticmethod
+    def _sens_effect_for(t: float) -> dict:
+        """Map a threshold to (text, color) for False Positives / Accuracy / False Negatives."""
+        if t <= 0.45:
+            return {"fp": ("Very Low", COLOR_SAFE), "acc": ("High", COLOR_SAFE), "fn": ("High", COLOR_DANGER)}
+        if t <= 0.55:
+            return {"fp": ("Low", COLOR_SAFE), "acc": ("Very High", COLOR_SAFE), "fn": ("Medium", COLOR_WARNING)}
+        if t <= 0.65:
+            return {"fp": ("Medium", COLOR_WARNING), "acc": ("High", COLOR_SAFE), "fn": ("Low", COLOR_SAFE)}
+        return {"fp": ("High", COLOR_DANGER), "acc": ("Medium", COLOR_WARNING), "fn": ("Very Low", COLOR_SAFE)}
+
     def _recognition_section(self, master, *, row: int) -> int:
-        card = self._section_card(master, "Recognition Settings")
+        card = ctk.CTkFrame(
+            master, fg_color=COLOR_SURFACE, corner_radius=16,
+            border_width=1, border_color=COLOR_BORDER,
+        )
         card.grid(row=row, column=0, sticky="ew", padx=PADDING, pady=(0, 12))
         card.grid_columnconfigure(0, weight=1)
 
-        self._tol_var = ctk.DoubleVar(value=float(getattr(self.recognizer, "tolerance", 0.5)))
+        threshold0 = float(getattr(self.recognizer, "threshold", 0.6))
+        label0 = getattr(self.recognizer, "sensitivity_label", "Balanced")
 
-        tol_row = ctk.CTkFrame(card, fg_color="transparent")
-        tol_row.pack(fill="x", padx=PADDING, pady=(0, 10))
-        tol_row.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(tol_row, text="Tolerance", font=body_small_font(), text_color=COLOR_TEXT_MUTED).grid(
-            row=0, column=0, sticky="w", padx=(0, 12)
+        # Title row: heading + live sensitivity badge
+        title_row = ctk.CTkFrame(card, fg_color="transparent")
+        title_row.pack(fill="x", padx=PADDING, pady=(PADDING, 4))
+        title_row.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            title_row, text="Recognition Sensitivity", font=heading_font(16), text_color=COLOR_TEXT,
+        ).grid(row=0, column=0, sticky="w")
+        bg0, fg0 = self._sens_badge_style(label0)
+        self._sens_badge = ctk.CTkLabel(
+            title_row, text=label0, font=body_small_font(), text_color=fg0,
+            fg_color=bg0, corner_radius=8, padx=10, pady=3,
         )
-        self._tol_value = ctk.CTkLabel(
-            tol_row, text=f"{self._tol_var.get():.2f}", font=body_small_font(), text_color=COLOR_TEXT
+        self._sens_badge.grid(row=0, column=1, sticky="e")
+
+        # Subtitle
+        ctk.CTkLabel(
+            card,
+            text="Lower = stricter matching (fewer false positives). "
+                 "Higher = more lenient (fewer missed faces).",
+            font=body_small_font(), text_color=COLOR_TEXT_MUTED, wraplength=520, justify="left",
+        ).pack(anchor="w", padx=PADDING, pady=(0, 10))
+
+        # Slider
+        slider = ctk.CTkSlider(
+            card, from_=0.30, to=0.85, number_of_steps=11, command=self._on_threshold,
         )
-        self._tol_value.grid(row=0, column=2, sticky="e")
+        slider.set(threshold0)
+        slider.pack(fill="x", padx=PADDING, pady=(0, 2))
 
-        def _on_tol(v: float) -> None:
-            stepped = round(float(v) / 0.05) * 0.05
-            stepped = max(0.30, min(0.70, stepped))
-            self._tol_var.set(stepped)
-            self._tol_value.configure(text=f"{stepped:.2f}")
-            try:
-                self.recognizer.tolerance = float(stepped)
-            except Exception:
-                pass
-
-        tol_slider = ctk.CTkSlider(
-            tol_row,
-            from_=0.30,
-            to=0.70,
-            number_of_steps=8,
-            command=_on_tol,
+        # Value label (centered)
+        self._sens_value = ctk.CTkLabel(
+            card, text=f"{threshold0:.2f}", font=body_small_font(), text_color=COLOR_TEXT_MUTED,
         )
-        tol_slider.set(float(self._tol_var.get() or 0.5))
-        tol_slider.grid(row=0, column=1, sticky="ew")
+        self._sens_value.pack(pady=(0, 4))
 
-        btn_row = ctk.CTkFrame(card, fg_color="transparent")
-        btn_row.pack(fill="x", padx=PADDING, pady=(0, 6))
+        # Range labels
+        range_row = ctk.CTkFrame(card, fg_color="transparent")
+        range_row.pack(fill="x", padx=PADDING, pady=(0, 12))
+        range_row.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkLabel(
+            range_row, text="← Strict", font=body_small_font(), text_color=COLOR_TEXT_MUTED,
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(
+            range_row, text="Lenient →", font=body_small_font(), text_color=COLOR_TEXT_MUTED,
+        ).grid(row=0, column=1, sticky="e")
 
+        # Live effect indicator — 3 mini-cards
+        eff = self._sens_effect_for(threshold0)
+        eff_row = ctk.CTkFrame(card, fg_color="transparent")
+        eff_row.pack(fill="x", padx=PADDING, pady=(0, 12))
+        eff_row.grid_columnconfigure((0, 1, 2), weight=1, uniform="eff")
+
+        def _mini(col: int, icon: str, header: str, value: str, color: str):
+            mc = ctk.CTkFrame(eff_row, fg_color=COLOR_BG, corner_radius=8)
+            mc.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 8, 0))
+            mc.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(
+                mc, text=f"{icon}  {header}", font=body_small_font(), text_color=COLOR_TEXT_MUTED,
+            ).grid(row=0, column=0, pady=(10, 2), padx=8)
+            val = ctk.CTkLabel(mc, text=value, font=body_small_font(), text_color=color)
+            val.grid(row=1, column=0, pady=(0, 10), padx=8)
+            return val
+
+        self._eff_fp = _mini(0, "⚠", "False Positives", eff["fp"][0], eff["fp"][1])
+        self._eff_acc = _mini(1, "🎯", "Accuracy", eff["acc"][0], eff["acc"][1])
+        self._eff_fn = _mini(2, "🙈", "False Negatives", eff["fn"][0], eff["fn"][1])
+
+        # Apply & Reload Faces
         ctk.CTkButton(
-            btn_row,
-            text="Reload Known Faces",
-            height=34,
-            corner_radius=CORNER_RADIUS,
-            fg_color=COLOR_BORDER,
-            hover_color=COLOR_ACCENT_HOVER,
-            command=self._reload_faces,
-        ).pack(side="left")
-
-        self._faces_loaded_label = ctk.CTkLabel(
-            btn_row, text="0 faces loaded", font=body_small_font(), text_color=COLOR_TEXT_MUTED
-        )
-        self._faces_loaded_label.pack(side="right")
+            card, text="Apply & Reload Faces", height=40, corner_radius=10,
+            fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, command=self._apply_and_reload,
+        ).pack(fill="x", padx=PADDING, pady=(0, PADDING))
 
         return row + 1
 
-    def _reload_faces(self) -> None:
+    def _on_threshold(self, v: float) -> None:
+        stepped = round(float(v) / 0.05) * 0.05
+        stepped = max(0.30, min(0.85, stepped))
         try:
-            self.recognizer.load_known_faces()
-        except Exception as exc:
-            show_toast(self, f"Failed to reload faces: {exc}", type="error")
-            return
-        self._refresh_faces_loaded()
-        show_toast(self, "Known faces reloaded.", type="success")
+            self.recognizer.threshold = float(stepped)
+        except Exception:
+            pass
+        self._sens_value.configure(text=f"{stepped:.2f}")
+        label = getattr(self.recognizer, "sensitivity_label", "Balanced")
+        bg, fg = self._sens_badge_style(label)
+        self._sens_badge.configure(text=label, fg_color=bg, text_color=fg)
+        eff = self._sens_effect_for(stepped)
+        self._eff_fp.configure(text=eff["fp"][0], text_color=eff["fp"][1])
+        self._eff_acc.configure(text=eff["acc"][0], text_color=eff["acc"][1])
+        self._eff_fn.configure(text=eff["fn"][0], text_color=eff["fn"][1])
+
+    def _apply_and_reload(self) -> None:
+        """Reload enrolled faces off the UI thread; toast on completion."""
+        def _work() -> None:
+            try:
+                self.recognizer.load_known_faces()
+                ok, msg = True, "Sensitivity applied. Known faces reloaded."
+            except Exception as exc:
+                ok, msg = False, f"Failed to reload faces: {exc}"
+
+            def _done() -> None:
+                try:
+                    show_toast(self, msg, type="success" if ok else "error")
+                except Exception:
+                    pass
+                if ok:
+                    self._refresh_faces_loaded()
+
+            try:
+                if self.winfo_exists():
+                    self.after(0, _done)
+            except Exception:
+                pass
+
+        threading.Thread(target=_work, daemon=True).start()
 
     def _refresh_faces_loaded(self) -> None:
         try:
@@ -325,6 +415,43 @@ class SettingsPanel(ctk.CTkFrame):
         ]:
             try:
                 setattr(self.checker, attr, bool(var.get()))
+            except Exception:
+                pass
+
+    def _notifications_section(self, master, *, row: int) -> int:
+        card = self._section_card(master, "Notifications")
+        card.grid(row=row, column=0, sticky="ew", padx=PADDING, pady=(0, 12))
+        card.grid_columnconfigure(0, weight=1)
+
+        switches = ctk.CTkFrame(card, fg_color="transparent")
+        switches.pack(fill="x", padx=PADDING, pady=(0, PADDING))
+        switches.grid_columnconfigure(0, weight=1)
+
+        sound_on = bool(getattr(self.notifier, "sound_enabled", True))
+        toast_on = bool(getattr(self.notifier, "toast_enabled", True))
+        self._enable_sound = ctk.BooleanVar(value=sound_on)
+        self._enable_toast = ctk.BooleanVar(value=toast_on)
+
+        items = [
+            ("Sound alerts", self._enable_sound, "sound_enabled"),
+            ("On-screen toasts", self._enable_toast, "toast_enabled"),
+        ]
+        for i, (label, var, attr) in enumerate(items):
+            sw = ctk.CTkSwitch(
+                switches, text=label, variable=var, onvalue=True, offvalue=False,
+                command=lambda a=attr: self._apply_notification_toggles(a),
+            )
+            sw.grid(row=i, column=0, sticky="w", pady=4)
+
+        return row + 1
+
+    def _apply_notification_toggles(self, _changed: str | None) -> None:
+        for attr, var in [
+            ("sound_enabled", self._enable_sound),
+            ("toast_enabled", self._enable_toast),
+        ]:
+            try:
+                setattr(self.notifier, attr, bool(var.get()))
             except Exception:
                 pass
 

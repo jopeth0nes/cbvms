@@ -15,6 +15,7 @@ import customtkinter as ctk
 import numpy as np
 
 from core.camera import CameraCapture
+from core.notifier import Notifier
 from core.person_detector import PersonDetector
 from core.recognizer import FaceRecognizer
 from core.trainer import ViolationTrainer
@@ -22,6 +23,7 @@ from core.violation_engine import LiveViolationChecker
 from database.db_manager import CBVMSDatabase
 from ui.camera_feed import CameraFeed
 from ui.enrollment import EnrollmentPanel
+from ui.notifications_panel import NotificationsPanel
 from ui.settings import SettingsPanel
 from ui.training_panel import TrainingPanel
 from ui.violation_log import ViolationLogPanel
@@ -83,10 +85,12 @@ class CBVMSDashboard(ctk.CTk):
         # Face recognizer (MTCNN + InceptionResnetV1) — lazy model load inside
         self._recognizer = FaceRecognizer(self._database)
 
+        # Real-time notification broker (sound + toast + bell badge + log panel)
+        self._notifier = Notifier()
         # YOLOv8 classification trainer (uniform / earring modules)
         self._trainer = ViolationTrainer()
         # Live violation checker (uniform / earring) backed by the trainer models
-        self._checker = LiveViolationChecker(self._trainer)
+        self._checker = LiveViolationChecker(self._trainer, notifier=self._notifier)
         # Full-body person detector (YOLOv8n) for reliable torso crops
         try:
             self._person_detector = PersonDetector()
@@ -108,6 +112,7 @@ class CBVMSDashboard(ctk.CTk):
         self._enrollment_panel: EnrollmentPanel | None = None
         self._violation_panel: ViolationLogPanel | None = None
         self._settings_panel: SettingsPanel | None = None
+        self._notifications_panel: NotificationsPanel | None = None
 
         self._stat_today_value: ctk.CTkLabel | None = None
         self._stat_unreviewed_value: ctk.CTkLabel | None = None
@@ -124,6 +129,8 @@ class CBVMSDashboard(ctk.CTk):
         self._load_camera_preference()
 
         self._build_ui()
+        # Deliver notifications to the UI thread (toast + bell badge).
+        self._notifier.subscribe(lambda n: self.after(0, self._on_notification, n))
         self._build_menubar()
         self._tick_clock()
         self._schedule_feed_update()
@@ -162,7 +169,23 @@ class CBVMSDashboard(ctk.CTk):
         ctk.CTkLabel(
             sidebar, text="Vision Monitoring System",
             font=body_small_font(), text_color=COLOR_TEXT_MUTED,
-        ).pack(anchor="w", padx=PADDING, pady=(0, PADDING_LG))
+        ).pack(anchor="w", padx=PADDING, pady=(0, PADDING))
+
+        # Notification bell with unread-count badge overlay.
+        bell_wrap = ctk.CTkFrame(sidebar, fg_color="transparent", height=44)
+        bell_wrap.pack(fill="x", padx=PADDING, pady=(0, PADDING))
+        bell_btn = ctk.CTkButton(
+            bell_wrap, text="🔔  Alerts", anchor="w", height=40,
+            corner_radius=CORNER_RADIUS, fg_color=COLOR_BORDER, hover_color=COLOR_ACCENT_HOVER,
+            text_color=COLOR_TEXT, font=body_small_font(),
+            command=self._open_alerts_from_bell,
+        )
+        bell_btn.pack(fill="x")
+        self._bell_badge = ctk.CTkLabel(
+            bell_wrap, text="", width=18, height=18, corner_radius=999,
+            fg_color=COLOR_DANGER, text_color=COLOR_TEXT, font=body_small_font(),
+        )
+        # Placed/forgotten dynamically in _update_bell_badge().
 
         nav_items = [
             ("live",       "📹  Live Monitor"),
@@ -304,8 +327,14 @@ class CBVMSDashboard(ctk.CTk):
             on_camera_source_connected=self._on_camera_source_connected,
             trainer=self._trainer,
             checker=self._checker,
+            notifier=self._notifier,
         )
         self._settings_panel.grid_remove()
+
+        self._notifications_panel = NotificationsPanel(
+            self._view_host, notifier=self._notifier, on_change=self._update_bell_badge,
+        )
+        self._notifications_panel.grid_remove()
 
         self._views: dict[str, ctk.CTkFrame] = {
             "live":       self._live_frame,
@@ -313,6 +342,7 @@ class CBVMSDashboard(ctk.CTk):
             "violations": self._violation_panel,
             "training":   self._training_panel,
             "settings":   self._settings_panel,
+            "alerts":     self._notifications_panel,
         }
         self._live_frame.grid(row=0, column=0, sticky="nsew")
         self._schedule_stats_refresh()
@@ -426,6 +456,7 @@ class CBVMSDashboard(ctk.CTk):
             "violations": "Violation Log",
             "training":   "Training",
             "settings":   "Settings",
+            "alerts":     "Notifications",
         }
         self._center_title.configure(text=titles.get(key, "CBVMS"))
 
@@ -438,6 +469,8 @@ class CBVMSDashboard(ctk.CTk):
                 self._enrollment_panel.on_show()
             if key == "violations" and self._violation_panel is not None:
                 self._violation_panel.refresh()
+            if key == "alerts" and self._notifications_panel is not None:
+                self._notifications_panel.refresh_external()
 
         self._fade_transition(_switch_views)
 
@@ -451,6 +484,52 @@ class CBVMSDashboard(ctk.CTk):
             self.attributes("-alpha", 1.0)
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Notifications
+    # ------------------------------------------------------------------
+
+    def _on_notification(self, notif) -> None:
+        """UI-thread: show a toast (if enabled) and refresh the bell badge."""
+        if self._notifier.toast_enabled:
+            try:
+                show_toast(
+                    self, f"⚠  {notif.student_name}: {notif.violation}",
+                    type="warning", duration=4000,
+                )
+            except Exception:
+                pass
+        self._update_bell_badge()
+
+    def _update_bell_badge(self) -> None:
+        """Refresh the sidebar bell badge from the notifier's unread count.
+
+        Tolerant of teardown: a notification can be scheduled (after(0, …)) and
+        then run after the window is closed, at which point Tk calls raise
+        TclError — including winfo_exists() — so the whole body is guarded.
+        """
+        badge = getattr(self, "_bell_badge", None)
+        if badge is None:
+            return
+        try:
+            count = self._notifier.unread_count()
+            if count <= 0:
+                badge.place_forget()
+                return
+            badge.configure(text="9+" if count > 9 else str(count))
+            badge.place(relx=1.0, rely=0.0, anchor="ne", x=-2, y=2)
+        except Exception:
+            pass
+
+    def _mark_all_read(self) -> None:
+        self._notifier.mark_all_read()
+        self._update_bell_badge()
+        if self._notifications_panel is not None:
+            self._notifications_panel.refresh_external()
+
+    def _open_alerts_from_bell(self) -> None:
+        self._on_nav_select("alerts")
+        self._mark_all_read()
 
     # ------------------------------------------------------------------
     # Camera preferences
@@ -715,6 +794,12 @@ class CBVMSDashboard(ctk.CTk):
         except Exception as exc:
             print(f"[CBVMS] log_violation error: {exc}")
             return
+
+        # Fire a real-time notification (sound + toast + bell badge + log panel).
+        # Cooldown above already de-duplicates, so this won't spam per frame.
+        display_name = (det.get("name") or "Unknown") if violation_type != "unknown_person" else "Unidentified person"
+        display_violation = "Unidentified person detected" if violation_type == "unknown_person" else violation_type
+        self._notifier.notify(display_name, display_violation)
 
         if self._active_nav == "violations" and self._violation_panel is not None:
             self.after(0, self._violation_panel.refresh)
