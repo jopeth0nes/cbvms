@@ -15,8 +15,10 @@ import customtkinter as ctk
 import numpy as np
 
 from core.camera import CameraCapture
+from core.person_detector import PersonDetector
 from core.recognizer import FaceRecognizer
 from core.trainer import ViolationTrainer
+from core.violation_engine import LiveViolationChecker
 from database.db_manager import CBVMSDatabase
 from ui.camera_feed import CameraFeed
 from ui.enrollment import EnrollmentPanel
@@ -50,7 +52,9 @@ from ui.components import (
 FEED_FPS = 30
 MAX_ALERTS = 50
 PRESENCE_TIMEOUT_SECS = 30   # seconds absent from frame before re-appearance triggers UI alert
-DB_LOG_COOLDOWN_SECS   = 300 # 5-minute minimum between DB violation entries per person
+DB_LOG_COOLDOWN_SECS   = 300 # 5-minute minimum between DB log entries per person
+
+ORANGE_BGR = (0, 165, 255)   # torso box color (distinct from green/red/blue face box)
 
 
 class CBVMSDashboard(ctk.CTk):
@@ -81,6 +85,14 @@ class CBVMSDashboard(ctk.CTk):
 
         # YOLOv8 classification trainer (uniform / earring modules)
         self._trainer = ViolationTrainer()
+        # Live violation checker (uniform / earring) backed by the trainer models
+        self._checker = LiveViolationChecker(self._trainer)
+        # Full-body person detector (YOLOv8n) for reliable torso crops
+        try:
+            self._person_detector = PersonDetector()
+        except Exception as exc:
+            print(f"[CBVMS] PersonDetector init failed: {exc}")
+            self._person_detector = None
 
         # Background face detection state
         self._face_detections: list[dict] = []
@@ -291,6 +303,7 @@ class CBVMSDashboard(ctk.CTk):
             apply_camera_settings=self._apply_camera_settings,
             on_camera_source_connected=self._on_camera_source_connected,
             trainer=self._trainer,
+            checker=self._checker,
         )
         self._settings_panel.grid_remove()
 
@@ -566,12 +579,145 @@ class CBVMSDashboard(ctk.CTk):
             try:
                 frame = self._face_queue.get(timeout=1.0)
                 detections = self._recognizer.recognize_faces(frame)
+                # Run uniform/earring classifiers on each person (background thread)
+                self._check_violations(detections, frame)
                 if self.winfo_exists():
                     self.after(0, self._on_detections_ready, detections, frame)
             except queue.Empty:
                 pass
             except Exception as exc:
                 print(f"[CBVMS] face worker error: {exc}")
+
+    @staticmethod
+    def _match_face_to_person(face_box, person_boxes):
+        """Return the person box that best contains the face (overlap/face_area ≥ 0.5)."""
+        fx1, fy1, fx2, fy2 = face_box
+        fa = max(1, (fx2 - fx1) * (fy2 - fy1))
+        best, best_ov = None, 0.0
+        for pb in person_boxes:
+            px1, py1, px2, py2 = pb
+            ix1, iy1 = max(fx1, px1), max(fy1, py1)
+            ix2, iy2 = min(fx2, px2), min(fy2, py2)
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            ov = inter / fa
+            if ov > best_ov:
+                best_ov, best = ov, pb
+        return best if best_ov >= 0.5 else None
+
+    def _check_violations(self, detections: list[dict], frame: np.ndarray | None) -> None:
+        """Background-thread: run uniform/earring classifiers on each enrolled person.
+
+        Attaches per-detection: violation (str|None), uniform_label, uniform_conf,
+        torso_box. Logs real violations / unknown persons to the DB (300s cooldown).
+        """
+        for det in detections:
+            det["violation"] = None
+            det["uniform_label"] = None
+            det["uniform_conf"] = 0.0
+            det["torso_box"] = None
+        if frame is None:
+            return
+
+        h, w = frame.shape[:2]
+
+        # Person detection runs once per frame, only when uniform checking is useful.
+        person_boxes: list = []
+        uniform_on = (
+            self._person_detector is not None
+            and self._checker.check_uniform
+            and self._trainer.is_trained("uniform")
+        )
+        if uniform_on and any(d.get("matched") for d in detections):
+            person_boxes = self._person_detector.detect_persons(frame)
+
+        earring_on = self._checker.check_earring and self._trainer.is_trained("earring")
+
+        for det in detections:
+            x1, y1, x2, y2 = [int(v) for v in det["box"]]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            if not det.get("matched"):
+                # Unknown person: log for security (no classifier run).
+                self._log_db(det, frame, [x1, y1, x2, y2], "unknown_person")
+                continue
+
+            parts: list[str] = []
+            person_box = None
+
+            # --- Uniform check (torso crop from person box) ---
+            if uniform_on and person_boxes:
+                person_box = self._match_face_to_person([x1, y1, x2, y2], person_boxes)
+                if person_box is not None:
+                    torso_crop = self._person_detector.get_torso_crop(frame, person_box)
+                    if torso_crop is not None:
+                        try:
+                            label, conf = self._trainer.predict("uniform", torso_crop)
+                        except Exception as exc:
+                            print(f"[CBVMS] uniform predict error: {exc}")
+                            label, conf = None, 0.0
+                        if label is not None:
+                            det["uniform_label"] = label
+                            det["uniform_conf"] = conf
+                            det["torso_box"] = self._person_detector.get_torso_box(person_box)
+                            if label == "wrong_uniform" and conf >= 0.65:
+                                parts.append(f"Wrong uniform ({conf:.0%})")
+
+            # --- Earring check (face crop, male only) ---
+            if earring_on and (det.get("gender", "") or "").lower() == "male":
+                try:
+                    label, conf = self._trainer.predict("earring", frame[y1:y2, x1:x2])
+                except Exception as exc:
+                    print(f"[CBVMS] earring predict error: {exc}")
+                    label, conf = None, 0.0
+                if label == "with_earring" and conf >= 0.65:
+                    parts.append(f"Earring detected ({conf:.0%})")
+
+            det["violation"] = ", ".join(parts) if parts else None
+            if det["violation"]:
+                # Snapshot: full person box if known, else the face box.
+                snap_box = person_box if person_box is not None else [x1, y1, x2, y2]
+                self._log_db(det, frame, snap_box, det["violation"])
+
+    def _log_db(self, det: dict, frame: np.ndarray, box: list[int], violation_type: str) -> None:
+        """Persist a violation / unknown person with a 300s per-person cooldown."""
+        key = det.get("student_id") or "unknown"
+        cooldown_key = f"{key}:{'unknown' if violation_type == 'unknown_person' else 'violation'}"
+        now = time.monotonic()
+        if now - self._db_log_cooldowns.get(cooldown_key, 0.0) < DB_LOG_COOLDOWN_SECS:
+            return
+        self._db_log_cooldowns[cooldown_key] = now
+
+        snapshot_jpeg: bytes | None = None
+        try:
+            bx1, by1, bx2, by2 = [int(v) for v in box]
+            h, w = frame.shape[:2]
+            bx1, by1 = max(0, bx1), max(0, by1)
+            bx2, by2 = min(w, bx2), min(h, by2)
+            crop = frame[by1:by2, bx1:bx2]
+            if crop.size > 0:
+                ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                if ok:
+                    snapshot_jpeg = buf.tobytes()
+        except Exception:
+            pass
+
+        try:
+            self._database.log_violation(
+                student_id=key,
+                student_name=det.get("name", "Unknown"),
+                violation_type=violation_type,
+                snapshot_jpeg=snapshot_jpeg,
+                status="unreviewed",
+            )
+        except Exception as exc:
+            print(f"[CBVMS] log_violation error: {exc}")
+            return
+
+        if self._active_nav == "violations" and self._violation_panel is not None:
+            self.after(0, self._violation_panel.refresh)
 
     def _on_detections_ready(self, detections: list[dict], frame: np.ndarray | None = None) -> None:
         """UI-thread callback: update annotation state and fire presence-based alerts.
@@ -605,74 +751,62 @@ class CBVMSDashboard(ctk.CTk):
             del self._face_presence[k]
 
     def _push_alert(self, det: dict, frame: np.ndarray | None = None) -> None:
-        """Add one alert card and persist to the violations table."""
-        # Crop face snapshot
-        snapshot_jpeg: bytes | None = None
-        if frame is not None:
-            try:
-                x1, y1, x2, y2 = [int(v) for v in det["box"]]
-                h, w = frame.shape[:2]
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(w, x2), min(h, y2)
-                crop = frame[y1:y2, x1:x2] if (x2 > x1 and y2 > y1) else frame
-                ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                if ok:
-                    snapshot_jpeg = buf.tobytes()
-            except Exception:
-                pass
-
-        # Persist to violations table — throttled by DB_LOG_COOLDOWN_SECS (default 5 min)
-        # This prevents rapid re-logging of the same person which would make
-        # deleted records appear to immediately reappear.
-        db_key = det["student_id"] or "unknown"
-        now_ts = time.time()
-        last_logged = self._db_log_cooldowns.get(db_key, 0.0)
-        if now_ts - last_logged >= DB_LOG_COOLDOWN_SECS:
-            self._db_log_cooldowns[db_key] = now_ts
-            violation_type = "face_detected" if det["matched"] else "unknown_person"
-            try:
-                self._database.log_violation(
-                    student_id=db_key,
-                    student_name=det["name"],
-                    violation_type=violation_type,
-                    snapshot_jpeg=snapshot_jpeg,
-                )
-            except Exception as exc:
-                print(f"[CBVMS] log_violation error: {exc}")
-
-        # Update live alerts panel (in-memory card)
+        """Add one ephemeral live-alert card. DB logging happens in the worker."""
         entry = {
             "identity_key": det["student_id"] or "unknown",
             "name": det["name"],
             "student_id": det["student_id"] or "—",
             "gender": det.get("gender", "—"),
             "matched": det["matched"],
+            "violation": det.get("violation"),
             "time": datetime.now().strftime("%H:%M:%S"),
             "epoch": time.time(),
         }
         self._alerts.appendleft(entry)
         self._refresh_alerts_ui()
 
-        # Refresh violation log panel if it's open
-        if self._active_nav == "violations" and self._violation_panel is not None:
-            self._violation_panel.refresh()
+    @staticmethod
+    def _draw_pill(out, x: int, y_baseline: int, text: str, color) -> None:
+        """Draw a filled label pill anchored with its bottom edge at y_baseline."""
+        (lw, lh), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+        top = max(0, y_baseline - lh - 8)
+        cv2.rectangle(out, (x, top), (x + lw + 6, y_baseline), color, -1)
+        cv2.putText(out, text, (x + 3, y_baseline - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
 
     def _annotate_frame(self, frame: np.ndarray) -> np.ndarray:
-        """Draw face detection boxes + names onto a copy of the frame."""
+        """Draw face boxes + names, plus orange torso boxes with uniform labels."""
         if not self._face_detections:
             return frame
         out = frame.copy()
         for det in self._face_detections:
             x1, y1, x2, y2 = det["box"]
             matched = det["matched"]
-            color = (16, 185, 129) if matched else (68, 68, 239)  # BGR green / red
-            label = det["name"] if matched else "Unknown"
-            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-            # Label background
-            (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-            cv2.rectangle(out, (x1, y1 - lh - 8), (x1 + lw + 6, y1), color, -1)
-            cv2.putText(out, label, (x1 + 3, y1 - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+            has_violation = bool(det.get("violation"))
+
+            # Face box: green (OK) / red (violation) / blue (unknown)
+            if not matched:
+                face_color = (239, 68, 68)        # BGR blue-ish for unknown
+            elif has_violation:
+                face_color = (68, 68, 239)         # BGR red
+            else:
+                face_color = (16, 185, 129)        # BGR green
+            cv2.rectangle(out, (x1, y1), (x2, y2), face_color, 2)
+            self._draw_pill(out, x1, y1, det["name"] if matched else "Unknown", face_color)
+
+            # Torso box: orange + uniform prediction label
+            torso_box = det.get("torso_box")
+            if torso_box is not None:
+                tx1, ty1, tx2, ty2 = [int(v) for v in torso_box]
+                cv2.rectangle(out, (tx1, ty1), (tx2, ty2), ORANGE_BGR, 2)
+                u_label = det.get("uniform_label")
+                if u_label is not None:
+                    conf = det.get("uniform_conf", 0.0)
+                    if u_label == "wrong_uniform":
+                        tag = f"X Wrong uniform {conf:.0%}"
+                    else:
+                        tag = f"OK Uniform {conf:.0%}"
+                    self._draw_pill(out, tx1, ty1, tag, ORANGE_BGR)
         return out
 
     # ------------------------------------------------------------------
@@ -782,9 +916,16 @@ class CBVMSDashboard(ctk.CTk):
 
         for entry in self._alerts:
             matched = entry["matched"]
-            dot_color = COLOR_SAFE if matched else COLOR_DANGER
-            status_text = "Identified ✓" if matched else "Unidentified ✗"
-            status_color = COLOR_SAFE if matched else COLOR_DANGER
+            violation = entry.get("violation")
+            violations = violation.split(", ") if violation else []
+
+            # Dot: yellow = unknown, red = violation(s), green = clean
+            if not matched:
+                dot_color = COLOR_WARNING
+            elif violations:
+                dot_color = COLOR_DANGER
+            else:
+                dot_color = COLOR_SAFE
 
             card = ctk.CTkFrame(
                 self._alerts_scroll,
@@ -820,11 +961,26 @@ class CBVMSDashboard(ctk.CTk):
                 font=body_small_font(), text_color=COLOR_TEXT_MUTED, anchor="w",
             ).pack(side="left")
 
-            # Status chip
-            ctk.CTkLabel(
-                card, text=status_text, font=body_small_font(),
-                text_color=status_color, anchor="w",
-            ).pack(anchor="w", padx=10, pady=(0, 8))
+            # Violation / status row
+            if not matched:
+                ctk.CTkLabel(
+                    card, text="Not enrolled", font=body_small_font(),
+                    text_color=COLOR_TEXT_MUTED, anchor="w",
+                ).pack(anchor="w", padx=10, pady=(0, 8))
+            elif violations:
+                pill_row = ctk.CTkFrame(card, fg_color="transparent")
+                pill_row.pack(anchor="w", fill="x", padx=10, pady=(0, 8))
+                for v in violations:
+                    ctk.CTkLabel(
+                        pill_row, text=v, font=body_small_font(),
+                        text_color=COLOR_DANGER, fg_color="#3A1414",
+                        corner_radius=999, padx=8, pady=2,
+                    ).pack(side="left", padx=(0, 4), pady=2)
+            else:
+                ctk.CTkLabel(
+                    card, text="✓ OK", font=body_small_font(),
+                    text_color=COLOR_SAFE, anchor="w",
+                ).pack(anchor="w", padx=10, pady=(0, 8))
 
         # Scroll to newest (top)
         try:

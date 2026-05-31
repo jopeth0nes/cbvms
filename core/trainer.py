@@ -280,3 +280,69 @@ class ViolationTrainer:
             "sample_counts": self.get_sample_counts(module),
             "model_path": str(ROOT / MODULES[module]["model_out"]),
         }
+
+    def evaluate(
+        self,
+        module: str,
+        on_progress: Callable[[str], None],
+    ) -> dict | None:
+        """
+        Run inference on all samples in the training folder and compute metrics.
+        Returns a dict with keys: accuracy, per_class (dict label->precision/recall/f1/support),
+        confusion (2x2 list), total, correct.
+        Returns None if model not trained or no samples exist.
+        """
+        self._validate(module)
+        if not self.is_trained(module):
+            return None
+
+        labels = MODULES[module]["labels"]
+        y_true, y_pred = [], []
+
+        on_progress("Loading test samples...")
+        for label in labels:
+            files = list(self.label_dir(module, label).glob("*.jpg"))
+            for i, f in enumerate(files):
+                if i % 5 == 0:
+                    on_progress(f"Testing {label}: {i}/{len(files)}...")
+                img = cv2.imread(str(f))
+                if img is None:
+                    continue
+                pred_label, _ = self.predict(module, img)
+                y_true.append(label)
+                y_pred.append(pred_label or "unknown")
+
+        if not y_true:
+            return None
+
+        correct = sum(t == p for t, p in zip(y_true, y_pred))
+        total = len(y_true)
+        accuracy = correct / total if total else 0.0
+
+        per_class = {}
+        for lbl in labels:
+            tp = sum(t == lbl and p == lbl for t, p in zip(y_true, y_pred))
+            fp = sum(t != lbl and p == lbl for t, p in zip(y_true, y_pred))
+            fn = sum(t == lbl and p != lbl for t, p in zip(y_true, y_pred))
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+            support = sum(t == lbl for t in y_true)
+            per_class[lbl] = {"precision": precision, "recall": recall, "f1": f1, "support": support}
+
+        # 2x2 confusion matrix
+        confusion = [[0, 0], [0, 0]]
+        for t, p in zip(y_true, y_pred):
+            i = labels.index(t) if t in labels else 0
+            j = labels.index(p) if p in labels else 1
+            confusion[i][j] += 1
+
+        on_progress("Done.")
+        return {
+            "accuracy": accuracy,
+            "per_class": per_class,
+            "confusion": confusion,
+            "labels": labels,
+            "total": total,
+            "correct": correct,
+        }

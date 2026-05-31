@@ -202,9 +202,13 @@ class EnrollmentPanel(ctk.CTkFrame):
         photo_wrap.grid_rowconfigure(0, weight=1)
         photo_wrap.grid_columnconfigure(0, weight=1)
 
-        self._selected_photo_label = ctk.CTkLabel(
+        # tk.Label (not CTkLabel): CTkLabel.configure(image=None) fails to clear a
+        # raw ImageTk image, leaving a deleted student's photo on screen. tk.Label
+        # clears reliably with image="".
+        self._selected_photo_label = tk.Label(
             photo_wrap, text="Select a student to view photo",
-            font=body_font(13), text_color=COLOR_TEXT_MUTED, cursor="hand2",
+            bg=COLOR_BG, fg=COLOR_TEXT_MUTED, cursor="hand2",
+            font=("Helvetica", 13), bd=0,
         )
         self._selected_photo_label.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
         self._selected_photo_label.bind("<Button-1>", lambda _e: self._view_selected_photo())
@@ -298,7 +302,7 @@ class EnrollmentPanel(ctk.CTkFrame):
         if not selection:
             self._selected_pk = None
             self._update_btn.configure(state="disabled")
-            self._selected_photo_label.configure(image=None, text="Select a student to view photo")
+            self._clear_photo_label("Select a student to view photo")
             self._preview_caption.configure(text="")
             return
 
@@ -309,7 +313,7 @@ class EnrollmentPanel(ctk.CTkFrame):
         if student and student.get("photo"):
             self._show_photo_bytes(student["photo"], self._selected_photo_label)
         else:
-            self._selected_photo_label.configure(image=None, text="No photo on file")
+            self._clear_photo_label("No photo on file")
 
         if student:
             self._preview_caption.configure(
@@ -317,6 +321,27 @@ class EnrollmentPanel(ctk.CTkFrame):
             )
         else:
             self._preview_caption.configure(text="")
+
+    # ------------------------------------------------------------------
+    # Multi-frame capture (async — camera cache refreshes between after() ticks)
+    # ------------------------------------------------------------------
+
+    def _collect_frames(self, on_done, *, count: int = 10, interval_ms: int = 100) -> None:
+        """Collect `count` fresh camera frames `interval_ms` apart without blocking
+        the UI loop, then call on_done(frames). A blocking sleep loop would freeze
+        the event loop and return identical cached frames, so we chain after()."""
+        frames: list = []
+
+        def _grab(i: int = 0) -> None:
+            if not self.winfo_exists() or i >= count:
+                on_done(frames)
+                return
+            f = self.get_frame()
+            if f is not None:
+                frames.append(f.copy())
+            self.after(interval_ms, _grab, i + 1)
+
+        _grab(0)
 
     # ------------------------------------------------------------------
     # Image rendering (ImageTk — the render path that works here)
@@ -344,10 +369,15 @@ class EnrollmentPanel(ctk.CTkFrame):
     def _show_photo_bytes(self, photo_blob: bytes, label, max_w: int = 440, max_h: int = 440) -> None:
         photo = self._photo_bytes_to_photo(photo_blob, max_w, max_h)
         if photo is None:
-            label.configure(image=None, text="Could not load photo")
+            self._clear_photo_label("Could not load photo")
             return
         label.configure(image=photo, text="")
         label._cbvms_photo = photo  # prevent GC
+
+    def _clear_photo_label(self, text: str) -> None:
+        """Reliably clear the preview photo (tk.Label clears with image='')."""
+        self._selected_photo_label.configure(image="", text=text)
+        self._selected_photo_label._cbvms_photo = None
 
     def _resolve_selected_student(self) -> dict | None:
         if self._selected_pk is None:
@@ -493,10 +523,11 @@ class EnrollmentPanel(ctk.CTkFrame):
         btns.grid(row=2, column=0, columnspan=2, sticky="ew", padx=PADDING, pady=(0, PADDING))
         btns.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkButton(
+        self._enroll_capture_btn = ctk.CTkButton(
             btns, text="Capture & Enroll", height=40, corner_radius=CORNER_RADIUS,
             fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, command=self._capture_and_enroll,
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        )
+        self._enroll_capture_btn.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         ctk.CTkButton(
             btns, text="Cancel", width=130, height=40, corner_radius=CORNER_RADIUS,
             fg_color=COLOR_BORDER, hover_color="#DC2626", command=_close,
@@ -530,28 +561,51 @@ class EnrollmentPanel(ctk.CTkFrame):
         if self.recognizer is None:
             self._set_enroll_status("Face recognition not ready.", error=True)
             return
-
-        frame = self.get_frame()
-        if frame is None:
+        if self.get_frame() is None:
             self._set_enroll_status("Camera unavailable.", error=True)
             return
 
-        self._set_enroll_status("Detecting face…")
-        embedding, box = self.recognizer.encode_face(frame)
-        if embedding is None or box is None:
-            self._set_enroll_status(
-                "No face detected. Look directly at the camera and try again.", error=True,
+        # Collect 10 frames over ~1s, then average the embeddings.
+        btn = getattr(self, "_enroll_capture_btn", None)
+        if btn is not None:
+            btn.configure(state="disabled")
+        self._set_enroll_status("Capturing frames… hold still")
+        self._collect_frames(
+            lambda frames: self._finish_enroll(
+                frames, name, student_id, course, year_and_section, gender
             )
+        )
+
+    def _finish_enroll(self, frames, name, student_id, course, year_and_section, gender) -> None:
+        btn = getattr(self, "_enroll_capture_btn", None)
+
+        def _fail(msg: str) -> None:
+            self._set_enroll_status(msg, error=True)
+            if btn is not None and btn.winfo_exists():
+                btn.configure(state="normal")
+
+        if self.recognizer is None:
+            _fail("Face recognition not ready.")
             return
 
-        encoding_blob = pickle.dumps(embedding)
+        self._set_enroll_status("Processing…")
+        embedding, box = self.recognizer.encode_face_multi(frames, min_valid=3)
+        if embedding is None or box is None:
+            _fail("Could not detect a stable face. Ensure good lighting and hold still.")
+            return
+
+        last = next((f for f in reversed(frames) if f is not None), None)
+        if last is None:
+            _fail("Camera unavailable.")
+            return
+
         x1, y1, x2, y2 = [max(0, int(v)) for v in box]
-        face_crop = frame[y1:y2, x1:x2]
+        face_crop = last[y1:y2, x1:x2]
         if face_crop.size == 0:
-            face_crop = frame
+            face_crop = last
         ok, buf = cv2.imencode(".jpg", face_crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         if not ok:
-            self._set_enroll_status("Failed to encode photo.", error=True)
+            _fail("Failed to encode photo.")
             return
 
         try:
@@ -561,17 +615,16 @@ class EnrollmentPanel(ctk.CTkFrame):
                 course=course,
                 year_and_section=year_and_section,
                 gender=gender,
-                encoding=encoding_blob,
+                encoding=pickle.dumps(embedding),
                 photo=buf.tobytes(),
             )
         except Exception as exc:
-            self._set_enroll_status(f"Enrollment failed: {exc}", error=True)
+            _fail(f"Enrollment failed: {exc}")
             return
 
         self._clear_form()
         self._reload_students()
-        if self.recognizer is not None:
-            self.recognizer.load_known_faces()
+        self.recognizer.load_known_faces()
         self._set_status("Student enrolled successfully.", success=True)
         if self._enroll_close is not None:
             self._enroll_close()
@@ -597,7 +650,7 @@ class EnrollmentPanel(ctk.CTkFrame):
         if self.database.delete_student(self._selected_pk):
             self._selected_pk = None
             self._update_btn.configure(state="disabled")
-            self._selected_photo_label.configure(image=None, text="Select a student to view photo")
+            self._clear_photo_label("Select a student to view photo")
             self._preview_caption.configure(text="")
             self._set_status("Student deleted.", success=True)
             self._reload_students()
@@ -666,136 +719,59 @@ class EnrollmentPanel(ctk.CTkFrame):
         self._open_update_modal(student)
 
     def _open_update_modal(self, student: dict) -> None:
-        PV_W, PV_H = 380, 285
+        PV_W, PV_H = 320, 240
         target_pk = int(student["id"])
-        state: dict = {"frozen": None, "embedding": None, "box": None, "job": None,
-                       "live_img": None, "shot_img": None}
+        state: dict = {"job": None, "img": None, "preview_on": True, "capturing": False}
 
         modal = ctk.CTkToplevel(self)
         modal.title(f"Update Photo — {student.get('name', '')}")
         modal.configure(fg_color=COLOR_BG)
-        modal.geometry("840x540")
         modal.resizable(False, False)
         modal.transient(self.winfo_toplevel())
+        modal.update_idletasks()
+        sw, sh = modal.winfo_screenwidth(), modal.winfo_screenheight()
+        modal.geometry(f"480x360+{(sw - 480) // 2}+{(sh - 360) // 2}")
         modal.after(120, modal.lift)
         modal.after(200, lambda: self._safe_grab(modal))
 
-        modal.grid_columnconfigure((0, 1), weight=1)
-        modal.grid_rowconfigure(1, weight=1)
+        # Rounded content card
+        card = ctk.CTkFrame(modal, fg_color=COLOR_SURFACE, corner_radius=16,
+                            border_width=1, border_color=COLOR_BORDER)
+        card.pack(fill="both", expand=True, padx=PADDING, pady=PADDING)
 
         ctk.CTkLabel(
-            modal,
-            text=f"Updating: {student.get('name', '')}  ·  {student.get('student_id', '')}",
-            font=heading_font(15), text_color=COLOR_TEXT,
-        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=PADDING, pady=(PADDING, 8))
+            card, text=student.get("name", ""), font=heading_font(16), text_color=COLOR_TEXT,
+        ).pack(pady=(PADDING, 6))
 
-        # LEFT — current photo
-        left = ctk.CTkFrame(modal, fg_color=COLOR_SURFACE, corner_radius=CORNER_RADIUS,
-                            border_width=1, border_color=COLOR_BORDER)
-        left.grid(row=1, column=0, sticky="nsew", padx=(PADDING, 8), pady=(0, 8))
-        ctk.CTkLabel(left, text="Current Photo", font=body_font(12),
-                     text_color=COLOR_TEXT_MUTED).pack(anchor="w", padx=12, pady=(12, 6))
-        cur_label = ctk.CTkLabel(left, text="No photo on file", font=body_font(12),
-                                 text_color=COLOR_TEXT_MUTED, width=PV_W, height=PV_H,
-                                 fg_color=COLOR_BG, corner_radius=CORNER_RADIUS)
-        cur_label.pack(padx=12, pady=(0, 12))
-        if student.get("photo"):
-            cur_img = self._photo_bytes_to_photo(student["photo"], PV_W, PV_H)
-            if cur_img is not None:
-                cur_label._cbvms_photo = cur_img
-                cur_label.configure(image=cur_img, text="")
-
-        # RIGHT — live camera / captured
-        right = ctk.CTkFrame(modal, fg_color=COLOR_SURFACE, corner_radius=CORNER_RADIUS,
-                             border_width=1, border_color=COLOR_BORDER)
-        right.grid(row=1, column=1, sticky="nsew", padx=(8, PADDING), pady=(0, 8))
-        new_title = ctk.CTkLabel(right, text="Live Camera", font=body_font(12),
-                                 text_color=COLOR_TEXT_MUTED)
-        new_title.pack(anchor="w", padx=12, pady=(12, 6))
-        new_label = ctk.CTkLabel(right, text="Starting camera…", font=body_font(12),
-                                 text_color=COLOR_TEXT_MUTED, width=PV_W, height=PV_H,
-                                 fg_color=COLOR_BG, corner_radius=CORNER_RADIUS)
-        new_label.pack(padx=12, pady=(0, 12))
+        # Live preview — tk.Label (crash-safe with ImageTk reassignment)
+        preview_wrap = ctk.CTkFrame(card, fg_color=COLOR_BG, corner_radius=CORNER_RADIUS)
+        preview_wrap.pack(padx=PADDING, pady=(0, 8))
+        preview_label = tk.Label(
+            preview_wrap, text="Starting camera…", bd=0,
+            bg=COLOR_BG, fg=COLOR_TEXT_MUTED, width=44, height=12,
+        )
+        preview_label.pack(padx=6, pady=6)
 
         status_lbl = ctk.CTkLabel(
-            modal, text="Position the face in the frame, then click Capture.",
+            card, text="Look at the camera, then Capture & Update.",
             font=body_font(12), text_color=COLOR_TEXT_MUTED,
         )
-        status_lbl.grid(row=2, column=0, columnspan=2, sticky="w", padx=PADDING, pady=(0, 6))
 
-        btns = ctk.CTkFrame(modal, fg_color="transparent")
-        btns.grid(row=3, column=0, columnspan=2, sticky="ew", padx=PADDING, pady=(0, PADDING))
-        btns.grid_columnconfigure(0, weight=1)
-
-        def _tick() -> None:
-            if not modal.winfo_exists():
-                return
-            if state["frozen"] is None:
-                frame = self.get_frame()
-                if frame is not None:
-                    img = self._frame_to_photo(frame, PV_W, PV_H)
-                    if img is not None:
-                        state["live_img"] = img
-                        new_label.configure(image=img, text="")
-                else:
-                    new_label.configure(image=None, text="Camera unavailable")
-            state["job"] = modal.after(60, _tick)
-
-        def _capture() -> None:
-            if state["frozen"] is not None:
-                state.update(frozen=None, embedding=None, box=None)
-                new_title.configure(text="Live Camera")
-                capture_btn.configure(text="Capture")
-                save_btn.configure(state="disabled")
-                status_lbl.configure(text="Position the face in the frame, then click Capture.",
-                                     text_color=COLOR_TEXT_MUTED)
+        def _preview() -> None:
+            if not modal.winfo_exists() or not state["preview_on"]:
                 return
             frame = self.get_frame()
-            if frame is None:
-                status_lbl.configure(text="Camera unavailable.", text_color=COLOR_DANGER)
-                return
-            status_lbl.configure(text="Detecting face…", text_color=COLOR_TEXT_MUTED)
-            modal.update_idletasks()
-            embedding, box = self.recognizer.encode_face(frame)
-            if embedding is None or box is None:
-                status_lbl.configure(text="No face detected. Adjust position and try again.",
-                                     text_color=COLOR_DANGER)
-                return
-            state.update(frozen=frame.copy(), embedding=embedding, box=box)
-            shot = self._frame_to_photo(frame, PV_W, PV_H)
-            if shot is not None:
-                state["shot_img"] = shot
-                new_label.configure(image=shot, text="")
-            new_title.configure(text="Captured ✓")
-            capture_btn.configure(text="Retake")
-            save_btn.configure(state="normal")
-            status_lbl.configure(text="Face detected. Click Save to update.", text_color=COLOR_SAFE)
-
-        def _save() -> None:
-            if state["frozen"] is None or state["embedding"] is None:
-                return
-            frame, box, embedding = state["frozen"], state["box"], state["embedding"]
-            x1, y1, x2, y2 = [max(0, int(v)) for v in box]
-            crop = frame[y1:y2, x1:x2]
-            if crop.size == 0:
-                crop = frame
-            ok, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-            if not ok:
-                status_lbl.configure(text="Failed to encode photo.", text_color=COLOR_DANGER)
-                return
-            if self.database.update_student_encoding(target_pk, pickle.dumps(embedding), buf.tobytes()):
-                self.recognizer.load_known_faces()
-                self._reload_students()
-                try:
-                    self._show_photo_bytes(buf.tobytes(), self._selected_photo_label)
-                except Exception:
-                    pass
-                self._set_status("Photo updated successfully.", success=True)
-                _close()
+            if frame is not None:
+                img = self._frame_to_photo(frame, PV_W, PV_H)
+                if img is not None:
+                    state["img"] = img
+                    preview_label.configure(image=img, text="", width=PV_W, height=PV_H)
             else:
-                status_lbl.configure(text="Update failed.", text_color=COLOR_DANGER)
+                preview_label.configure(image="", text="Camera unavailable")
+            state["job"] = modal.after(50, _preview)
 
         def _close() -> None:
+            state["preview_on"] = False
             if state["job"] is not None:
                 try:
                     modal.after_cancel(state["job"])
@@ -808,20 +784,65 @@ class EnrollmentPanel(ctk.CTkFrame):
                 pass
             modal.destroy()
 
+        def _finish(frames) -> None:
+            def _retry(msg: str) -> None:
+                status_lbl.configure(text=msg, text_color=COLOR_DANGER)
+                if capture_btn.winfo_exists():
+                    capture_btn.configure(state="normal")
+                state["capturing"] = False
+
+            status_lbl.configure(text="Processing…", text_color=COLOR_TEXT_MUTED)
+            modal.update_idletasks()
+            embedding, box = self.recognizer.encode_face_multi(frames, min_valid=3)
+            if embedding is None or box is None:
+                _retry("Could not detect a stable face. Ensure good lighting and hold still.")
+                return
+            last = next((f for f in reversed(frames) if f is not None), None)
+            if last is None:
+                _retry("Camera unavailable.")
+                return
+            x1, y1, x2, y2 = [max(0, int(v)) for v in box]
+            crop = last[y1:y2, x1:x2]
+            if crop.size == 0:
+                crop = last
+            ok, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            if not ok:
+                _retry("Failed to encode photo.")
+                return
+            if self.database.update_student_encoding(target_pk, pickle.dumps(embedding), buf.tobytes()):
+                self.recognizer.load_known_faces()
+                self._reload_students()
+                try:
+                    self._show_photo_bytes(buf.tobytes(), self._selected_photo_label)
+                except Exception:
+                    pass
+                self._set_status("Photo updated successfully.", success=True)
+                _close()
+            else:
+                _retry("Update failed.")
+
+        def _capture() -> None:
+            if state["capturing"]:
+                return
+            state["capturing"] = True
+            capture_btn.configure(state="disabled")
+            status_lbl.configure(text="Capturing… hold still", text_color=COLOR_TEXT_MUTED)
+            self._collect_frames(_finish)
+
         capture_btn = ctk.CTkButton(
-            btns, text="Capture", height=38, corner_radius=CORNER_RADIUS,
-            fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, command=_capture,
+            card, text="📷  Capture & Update", height=44, corner_radius=12,
+            fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, font=body_font(14),
+            command=_capture,
         )
-        capture_btn.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        save_btn = ctk.CTkButton(
-            btns, text="Save", width=130, height=38, corner_radius=CORNER_RADIUS,
-            fg_color=COLOR_SAFE, hover_color="#0EA371", command=_save, state="disabled",
-        )
-        save_btn.grid(row=0, column=1, padx=(0, 8))
+        capture_btn.pack(fill="x", padx=PADDING, pady=(2, 6))
+
+        status_lbl.pack(pady=(0, 6))
+
         ctk.CTkButton(
-            btns, text="Cancel", width=130, height=38, corner_radius=CORNER_RADIUS,
-            fg_color=COLOR_BORDER, hover_color="#DC2626", command=_close,
-        ).grid(row=0, column=2)
+            card, text="Cancel", height=30, corner_radius=CORNER_RADIUS,
+            fg_color="transparent", hover_color=COLOR_BORDER,
+            text_color=COLOR_TEXT_MUTED, command=_close,
+        ).pack(pady=(0, PADDING))
 
         modal.protocol("WM_DELETE_WINDOW", _close)
-        _tick()
+        _preview()

@@ -125,6 +125,61 @@ class FaceRecognizer:
             print(f"[Recognizer] encode_face error: {exc}")
             return None, None
 
+    def encode_face_multi(
+        self,
+        frames: list[np.ndarray],
+        *,
+        min_valid: int = 3,
+    ) -> tuple[np.ndarray | None, list[int] | None]:
+        """Embed the best face in each frame and average the embeddings.
+
+        Returns (averaged_unit_embedding, best_box) where best_box [x1,y1,x2,y2]
+        comes from the frame with the highest MTCNN confidence. Returns
+        (None, None) if fewer than `min_valid` frames had a detectable face.
+        """
+        if not self._ensure_models():
+            return None, None
+
+        import torch
+
+        embeddings: list[np.ndarray] = []
+        best_box: list[int] | None = None
+        best_conf = -1.0
+
+        for frame in frames:
+            if frame is None or frame.size == 0:
+                continue
+            try:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil = Image.fromarray(rgb)
+                boxes, probs = self._mtcnn.detect(pil)
+                if boxes is None or len(boxes) == 0:
+                    continue
+                idx = int(np.argmax(probs))
+                conf = float(probs[idx])
+
+                faces = self._mtcnn(pil)  # aligned (N, 3, 160, 160) tensors
+                if faces is None:
+                    continue
+                with torch.no_grad():
+                    emb = self._resnet(faces[idx].unsqueeze(0))[0].numpy().astype(np.float32)
+                embeddings.append(emb)
+
+                if conf > best_conf:
+                    best_conf = conf
+                    best_box = [max(0, int(v)) for v in boxes[idx]]
+            except Exception:
+                continue
+
+        if len(embeddings) < min_valid:
+            return None, None
+
+        averaged = np.mean(embeddings, axis=0).astype(np.float32)
+        norm = float(np.linalg.norm(averaged))
+        if norm > 0:
+            averaged = averaged / norm
+        return averaged, best_box
+
     def recognize_faces(self, frame_bgr: np.ndarray) -> list[dict]:
         """Detect ALL faces in frame and identify each against enrolled students.
 

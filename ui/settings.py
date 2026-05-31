@@ -16,7 +16,7 @@ from core.trainer import MODULES
 if TYPE_CHECKING:
     from core.recognizer import Recognizer
     from core.trainer import ViolationTrainer
-    from core.violation_engine import ViolationEngine
+    from core.violation_engine import LiveViolationChecker, ViolationEngine
 
 from database.db_manager import CBVMSDatabase
 from ui.camera_configuration import CameraConfigurationSection
@@ -63,6 +63,7 @@ class SettingsPanel(ctk.CTkFrame):
         apply_camera_settings: Callable[[int, tuple[int, int], int], None],
         on_camera_source_connected: Callable[[dict], None] | None = None,
         trainer: "ViolationTrainer | None" = None,
+        checker: "LiveViolationChecker | None" = None,
         **kwargs,
     ) -> None:
         super().__init__(master, fg_color=COLOR_BG, **kwargs)
@@ -70,6 +71,7 @@ class SettingsPanel(ctk.CTkFrame):
         self.recognizer = recognizer
         self.violation_engine = violation_engine
         self.trainer = trainer
+        self.checker = checker
         self.username = username
         self.get_detector_loaded = get_detector_loaded
         self.apply_camera_settings = apply_camera_settings
@@ -315,15 +317,14 @@ class SettingsPanel(ctk.CTkFrame):
             pass
 
     def _apply_violation_toggles(self, _changed: str | None) -> None:
-        # These flags are implemented in ViolationEngine (added in this phase).
+        # Uniform / earring map to the live checker (YOLOv8 classifiers).
+        # Hair / ID badge have no live backend yet — left as UI-only switches.
         for attr, var in [
-            ("enable_hair_color_check", self._enable_hair),
-            ("enable_id_badge_check", self._enable_id),
-            ("enable_uniform_check", self._enable_uniform),
-            ("enable_earring_check", self._enable_earring),
+            ("check_uniform", self._enable_uniform),
+            ("check_earring", self._enable_earring),
         ]:
             try:
-                setattr(self.violation_engine, attr, bool(var.get()))
+                setattr(self.checker, attr, bool(var.get()))
             except Exception:
                 pass
 

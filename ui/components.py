@@ -106,8 +106,8 @@ def show_toast(master, message: str, type: str = "info", duration: int = 3000) -
     )
     toast.place(relx=1.0, rely=1.0, anchor="se", x=-18, y=-18)
 
-    bar = ctk.CTkFrame(toast, fg_color=accent, corner_radius=CORNER_RADIUS)
-    bar.place(x=0, y=0, relheight=1.0, width=6)
+    bar = ctk.CTkFrame(toast, fg_color=accent, corner_radius=CORNER_RADIUS, width=6)
+    bar.place(x=0, y=0, relheight=1.0)
 
     msg = ctk.CTkLabel(
         toast,
