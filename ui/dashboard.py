@@ -105,6 +105,20 @@ class CBVMSDashboard(ctk.CTk):
         self._face_worker = threading.Thread(target=self._face_worker_loop, daemon=True)
         self._face_worker.start()
 
+        # Fast real-time face detector (Haar) — runs on the UI thread every frame to
+        # reposition the recognized boxes live, so the on-screen square tracks head
+        # motion with no delay while the slow MTCNN recognizer handles identity.
+        self._live_face_boxes: list[list[int]] = []
+        try:
+            self._fast_face = cv2.CascadeClassifier(
+                cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            )
+            if self._fast_face.empty():
+                self._fast_face = None
+        except Exception as exc:
+            print(f"[CBVMS] fast face detector unavailable: {exc}")
+            self._fast_face = None
+
         # Separate DB-write cooldown (much longer than UI presence timeout)
         # Prevents rapid re-logging of the same person making deletes appear to do nothing
         self._db_log_cooldowns: dict[str, float] = {}  # identity_key → last_logged_epoch
@@ -658,10 +672,13 @@ class CBVMSDashboard(ctk.CTk):
             try:
                 frame = self._face_queue.get(timeout=1.0)
                 detections = self._recognizer.recognize_faces(frame)
-                # Run uniform/earring classifiers on each person (background thread)
-                self._check_violations(detections, frame)
+                # Deliver identities to the UI immediately so labels appear without
+                # waiting for the (much slower) violation classifiers below.
                 if self.winfo_exists():
                     self.after(0, self._on_detections_ready, detections, frame)
+                # Run uniform/earring classifiers; mutates the same det dicts in place,
+                # so the torso/violation overlay appears on the next render tick.
+                self._check_violations(detections, frame)
             except queue.Empty:
                 pass
             except Exception as exc:
@@ -859,13 +876,75 @@ class CBVMSDashboard(ctk.CTk):
         cv2.putText(out, text, (x + 3, y_baseline - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
 
+    def _detect_live_faces(self, frame: np.ndarray) -> list[list[int]]:
+        """Fast Haar face detection (UI thread) → boxes [x1,y1,x2,y2] in full-frame coords.
+
+        Cheap (~4-7 ms downscaled) so it can run every feed frame, giving the on-screen
+        square a real-time position that tracks head movement with no delay.
+        """
+        if self._fast_face is None or frame is None or frame.size == 0:
+            return []
+        try:
+            h, w = frame.shape[:2]
+            scale = w / 480.0 if w > 480 else 1.0
+            if scale != 1.0:
+                small = cv2.resize(frame, (int(w / scale), int(h / scale)))
+            else:
+                small = frame
+            gray = cv2.equalizeHist(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY))
+            faces = self._fast_face.detectMultiScale(
+                gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)
+            )
+            return [
+                [int(x * scale), int(y * scale), int((x + fw) * scale), int((y + fh) * scale)]
+                for (x, y, fw, fh) in faces
+            ]
+        except Exception:
+            return []
+
+    @staticmethod
+    def _pick_live_box(det_box, live_boxes, used) -> list[int] | None:
+        """Greedily assign the nearest unused live (Haar) box to a recognized det.
+
+        Returns the live box (real-time position) or None to fall back to the
+        recognizer's own (laggier) box. The match is capped at ~2.5× the face size so
+        a far-away false-positive box can never relabel the wrong location — only a
+        plausibly-same-person box is accepted (covers natural head movement between
+        the slower recognition updates).
+        """
+        dw = max(1, det_box[2] - det_box[0])
+        dh = max(1, det_box[3] - det_box[1])
+        max_dist_sq = (2.5 * max(dw, dh)) ** 2
+        dcx = (det_box[0] + det_box[2]) * 0.5
+        dcy = (det_box[1] + det_box[3]) * 0.5
+        best_j, best_d = None, None
+        for j, lb in enumerate(live_boxes):
+            if used[j]:
+                continue
+            lcx = (lb[0] + lb[2]) * 0.5
+            lcy = (lb[1] + lb[3]) * 0.5
+            d = (lcx - dcx) ** 2 + (lcy - dcy) ** 2
+            if best_d is None or d < best_d:
+                best_d, best_j = d, j
+        if best_j is None or best_d > max_dist_sq:
+            return None
+        used[best_j] = True
+        return live_boxes[best_j]
+
     def _annotate_frame(self, frame: np.ndarray) -> np.ndarray:
-        """Draw face boxes + names, plus orange torso boxes with uniform labels."""
+        """Draw face boxes + names, plus orange torso boxes with uniform labels.
+
+        The face square is positioned from the live Haar detector (no delay); identity,
+        color and torso/violation overlays come from the background recognizer.
+        """
         if not self._face_detections:
             return frame
         out = frame.copy()
+        live = list(self._live_face_boxes)
+        used = [False] * len(live)
         for det in self._face_detections:
-            x1, y1, x2, y2 = det["box"]
+            live_box = self._pick_live_box([int(v) for v in det["box"]], live, used)
+            x1, y1, x2, y2 = live_box if live_box is not None else [int(v) for v in det["box"]]
             matched = det["matched"]
             has_violation = bool(det.get("violation"))
 
@@ -925,6 +1004,8 @@ class CBVMSDashboard(ctk.CTk):
                                 self._face_queue.put_nowait(frame.copy())
                             except queue.Full:
                                 pass
+                        # Real-time face positions (cheap Haar) so the square has no lag
+                        self._live_face_boxes = self._detect_live_faces(frame)
                         # Annotate with latest detection results and render
                         annotated = self._annotate_frame(frame)
                         self.camera_feed.render(annotated)

@@ -33,6 +33,7 @@ class CBVMSLoginWindow(ctk.CTk):
         super().__init__()
         self._auth = auth_manager
         self.result_username: str | None = None
+        self.result: dict | None = None
         self._password_visible = False
 
         apply_cbvms_theme()
@@ -171,21 +172,47 @@ class CBVMSLoginWindow(ctk.CTk):
         username = self.username_entry.get().strip()
         password = self.password_entry.get()
 
-        if self._auth.verify_login(username, password):
+        result = self._auth.authenticate(username, password)
+        if result is not None:
             self.error_label.configure(text="")
-            self.result_username = username
+            self.result = result
+            self.result_username = result["username"]
             self.destroy()
             return
 
         self.error_label.configure(text="Invalid username or password.")
 
     def _on_close(self) -> None:
+        self.result = None
         self.result_username = None
         self.destroy()
 
 
 def run_login(auth_manager: AuthManager) -> str | None:
-    """Show the login window; return the username on success, or None if closed."""
-    app = CBVMSLoginWindow(auth_manager)
-    app.mainloop()
-    return app.result_username
+    """Show the login window and route by role.
+
+    - admin → return the username so the caller launches the admin dashboard.
+    - student → launch the StudentPortal here; loop back to login on logout,
+      or return None (exit) when the portal window is closed directly.
+    - closed login window → return None.
+    """
+    while True:
+        app = CBVMSLoginWindow(auth_manager)
+        app.mainloop()
+        result = app.result
+        if not result:
+            return None
+
+        if result["role"] == "student":
+            from ui.student_portal import StudentPortal
+
+            portal = StudentPortal(
+                student_id=result["student_id"],
+                display_name=result["display_name"],
+            )
+            portal.mainloop()
+            if getattr(portal, "logged_out", False):
+                continue  # back to the login screen
+            return None  # portal closed directly → exit the app
+
+        return result["username"]  # admin → caller opens the dashboard

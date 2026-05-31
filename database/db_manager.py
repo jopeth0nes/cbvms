@@ -11,6 +11,20 @@ from database.models import ALL_TABLES
 DEFAULT_ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "admin123"
 
+# Defined here (not models.py) so the student portal's report feature is self-contained.
+SYSTEM_REPORTS_TABLE = """
+CREATE TABLE IF NOT EXISTS system_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reporter_id TEXT,
+    reporter_name TEXT,
+    category TEXT,
+    title TEXT,
+    description TEXT,
+    submitted_at TEXT DEFAULT (datetime('now')),
+    status TEXT DEFAULT 'open'
+);
+"""
+
 
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
@@ -33,6 +47,7 @@ class CBVMSDatabase:
         with self.connect() as conn:
             for ddl in ALL_TABLES:
                 conn.execute(ddl)
+            conn.execute(SYSTEM_REPORTS_TABLE)
             # Migrations for existing databases
             cols = [row[1] for row in conn.execute("PRAGMA table_info(students)").fetchall()]
             if "gender" not in cols:
@@ -192,3 +207,67 @@ class CBVMSDatabase:
             cursor = conn.execute(sql, params or [])
             conn.commit()
             return cursor.rowcount
+
+    # ------------------------------------------------------------------
+    # Student-portal helpers
+    # ------------------------------------------------------------------
+
+    def get_student_by_student_id(self, student_id: str) -> dict | None:
+        """Fetch a student row by their student_id string (not PK). Dict or None."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM students WHERE student_id = ?",
+                ((student_id or "").strip(),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_violations_for_student(self, student_id: str) -> list[dict]:
+        """All violations for a student, newest first (snapshot column included)."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM violations WHERE student_id = ? ORDER BY timestamp DESC",
+                ((student_id or "").strip(),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_student_name(self, student_id: str, name: str) -> bool:
+        """Update a student's display name. Returns True if a row was changed."""
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "UPDATE students SET name = ? WHERE student_id = ?",
+                ((name or "").strip(), (student_id or "").strip()),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def insert_system_report(
+        self,
+        reporter_id: str,
+        reporter_name: str,
+        category: str,
+        title: str,
+        description: str,
+    ) -> bool:
+        """Persist a student-submitted system report. Returns True on success."""
+        try:
+            with self.connect() as conn:
+                conn.execute(SYSTEM_REPORTS_TABLE)  # defensive: ensure table exists
+                conn.execute(
+                    """
+                    INSERT INTO system_reports
+                        (reporter_id, reporter_name, category, title, description)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        (reporter_id or "").strip(),
+                        (reporter_name or "").strip(),
+                        (category or "").strip(),
+                        (title or "").strip(),
+                        (description or "").strip(),
+                    ),
+                )
+                conn.commit()
+            return True
+        except Exception as exc:
+            print(f"[DB] insert_system_report error: {exc}")
+            return False

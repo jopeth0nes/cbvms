@@ -1,6 +1,20 @@
 """Credential verification for CBVMS."""
 
+from __future__ import annotations
+
+import hashlib
+
 from database.db_manager import CBVMSDatabase
+
+# Hardcoded student portal account (not stored in the DB users table).
+STUDENT_CREDENTIALS = {
+    "student": {
+        "password_hash": hashlib.sha256("student123".encode()).hexdigest(),
+        "student_id": "2023-00883",
+        "display_name": "Student Portal",
+        "role": "student",
+    }
+}
 
 
 class AuthManager:
@@ -11,3 +25,35 @@ class AuthManager:
         if not username or not password:
             return False
         return self._db.verify_user(username, password)
+
+    def authenticate(self, username: str, password: str) -> dict | None:
+        """Return an auth dict on success, else None.
+
+        Checks the hardcoded student account first, then the DB-based admin users.
+        Dict keys: role ("admin"|"student"), username, student_id (None for admin),
+        display_name.
+        """
+        if not username or not password:
+            return None
+        uname = username.strip()
+
+        cred = STUDENT_CREDENTIALS.get(uname)
+        if cred is not None:
+            pw_hash = hashlib.sha256(password.encode()).hexdigest()
+            if pw_hash == cred["password_hash"]:
+                return {
+                    "role": "student",
+                    "username": uname,
+                    "student_id": cred["student_id"],
+                    "display_name": cred["display_name"],
+                }
+            return None
+
+        if self._db.verify_user(uname, password):
+            return {
+                "role": "admin",
+                "username": uname,
+                "student_id": None,
+                "display_name": uname,
+            }
+        return None
