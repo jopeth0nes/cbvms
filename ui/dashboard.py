@@ -958,6 +958,12 @@ class CBVMSDashboard(ctk.CTk):
             cv2.rectangle(out, (x1, y1), (x2, y2), face_color, 2)
             self._draw_pill(out, x1, y1, det["name"] if matched else "Unknown", face_color)
 
+            # Mark faces found by the OpenCV profile/frontal cascade fallback (MTCNN missed),
+            # so the admin can see the side-view recovery is working.
+            if det.get("detector_type") == "cascade":
+                cv2.putText(out, "profile", (x1, min(y2 + 16, out.shape[0] - 2)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, ORANGE_BGR, 1, cv2.LINE_AA)
+
             # Torso box: orange + uniform prediction label
             torso_box = det.get("torso_box")
             if torso_box is not None:

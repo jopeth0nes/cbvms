@@ -129,3 +129,52 @@ camera frame ──(every 5th, drop-on-busy)──► worker thread
 All inference is CPU-only and runs under the single `ultralytics` framework
 (YOLOv8 detection + YOLOv8-cls classification) plus MTCNN/FaceNet for identity —
 a unified, defensible computer-vision stack.
+
+## Profile View Fix
+
+### 1. Why MTCNN fails on profile / side views
+
+MTCNN is a cascade of three CNNs (P-Net → R-Net → O-Net) trained on the WIDER FACE /
+CelebA datasets, which are **overwhelmingly frontal**. Each stage proposes and refines
+candidate windows using features (two eyes, a nose bridge, a mouth — the five-point
+landmark layout) that only exist in a roughly **frontal pose**. Once the head yaws past
+about **±30°**, one eye and half the landmark geometry disappear, the O-Net confidence
+collapses below threshold, and the face is rejected. MTCNN is therefore a *frontal-biased*
+detector by construction — it is excellent head-on and blind in true profile.
+
+### 2. Why a single averaged embedding fails even when detection succeeds
+
+FaceNet/InceptionResnetV1 maps a face to a 512-D vector and we compare identities by
+**cosine distance**. A frontal embedding and a profile embedding of the *same person* are
+**not in the same region of the embedding space** — the visible geometry is different, so
+the network produces vectors that are far apart (cosine distance often > 0.6, our match
+threshold). Enrolling a **single averaged frontal embedding** means a live profile capture
+is compared only against a frontal anchor and is wrongly rejected as "Unknown." Averaging
+multiple *frontal* frames does not help; it just produces a cleaner frontal anchor.
+
+### 3. The two-part fix
+
+- **Dual-detector pipeline.** At inference we first run MTCNN; if it returns nothing we fall
+  back to OpenCV's `haarcascade_profileface.xml` (left-facing), then the same cascade on a
+  horizontally-flipped frame (right-facing), then `haarcascade_frontalface_default.xml`.
+  Cascade crops are aligned to 160×160 and normalized to `[-1, 1]` to match MTCNN's tensor
+  format, so the same FaceNet embedder runs unchanged.
+- **Multi-angle, multi-embedding enrollment.** A guided wizard captures **front + left +
+  right** poses and stores **one averaged embedding per angle** (a pickled `list`), giving
+  the gallery a profile anchor to match against.
+
+### 4. Why multiple angle embeddings per student is standard practice
+
+Production face-recognition systems use **gallery augmentation**: they store several
+templates per identity spanning pose, expression, and lighting, because a single template
+cannot cover the appearance manifold of a face. Storing front/left/right embeddings is the
+small-scale version of this — each stored vector anchors a different pose region so a live
+capture at any angle has a nearby gallery template.
+
+### 5. Matching strategy
+
+Recognition computes the **minimum cosine distance across *all* stored embeddings of *all*
+students** and matches if that minimum is below the sensitivity threshold. Because each
+student contributes several angle embeddings to the gallery, the closest-pose template wins
+— a live profile matches the enrolled profile embedding rather than being forced to compare
+against a frontal-only anchor.

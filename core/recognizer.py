@@ -35,6 +35,8 @@ class FaceRecognizer:
         self._lock = threading.Lock()
         self._mtcnn = None          # lazy — avoid slow import at startup
         self._resnet = None
+        self._profile_cascade = None  # OpenCV fallback detectors (loaded with models)
+        self._frontal_cascade = None
         self._known: list[tuple[dict, np.ndarray]] = []  # (student_row, embedding)
         self._models_loaded = False
         self.threshold: float = MATCH_THRESHOLD  # runtime-adjustable match sensitivity
@@ -60,6 +62,16 @@ class FaceRecognizer:
     def _ensure_models(self) -> bool:
         if self._models_loaded:
             return True
+        # Serialize the (slow) first load — the enrollment wizard warms models on a
+        # background thread while the live face worker may also call this; without the
+        # lock both would build MTCNN/ResNet at once (wasteful, and risks a torch-hub
+        # weight-download race). The fast path above stays lock-free after load.
+        with self._lock:
+            if self._models_loaded:
+                return True
+            return self._load_models()
+
+    def _load_models(self) -> bool:
         try:
             import torch
             from facenet_pytorch import MTCNN, InceptionResnetV1
@@ -71,10 +83,136 @@ class FaceRecognizer:
                 device="cpu",
             )
             self._resnet = InceptionResnetV1(pretrained="vggface2").eval()
+
+            # OpenCV Haar cascades as a fallback detector for profile/side views that
+            # MTCNN (frontal-biased) misses. Both ship with opencv-python — no download.
+            try:
+                self._profile_cascade = cv2.CascadeClassifier(
+                    cv2.data.haarcascades + "haarcascade_profileface.xml"
+                )
+                self._frontal_cascade = cv2.CascadeClassifier(
+                    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+                )
+                if self._profile_cascade.empty():
+                    self._profile_cascade = None
+                if self._frontal_cascade.empty():
+                    self._frontal_cascade = None
+            except Exception as exc:
+                print(f"[Recognizer] cascade load failed: {exc}")
+                self._profile_cascade = self._frontal_cascade = None
+
             self._models_loaded = True
             return True
         except Exception as exc:
             print(f"[Recognizer] model load failed: {exc}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Dual detector (MTCNN + OpenCV cascade fallback for profile views)
+    # ------------------------------------------------------------------
+
+    def _cascade_faces(self, cascade, gray) -> list[list[int]]:
+        if cascade is None:
+            return []
+        rects = cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=4, minSize=(60, 60)
+        )
+        return [[int(x), int(y), int(x + w), int(y + h)] for (x, y, w, h) in rects]
+
+    def _align_cascade_boxes(self, boxes: list[list[int]], frame_bgr: np.ndarray):
+        """Crop each box and build an MTCNN-style aligned tensor (N,3,160,160) in [-1,1].
+
+        Returns (kept_boxes, tensor) so the boxes stay in lock-step with the tensor rows
+        even if a box is dropped (empty crop) — pairing a box with the wrong embedding
+        would otherwise mislabel that detection.
+        """
+        import torch
+
+        tensors: list = []
+        kept: list[list[int]] = []
+        h, w = frame_bgr.shape[:2]
+        for box in boxes:
+            x1, y1, x2, y2 = box
+            x1c, y1c = max(0, x1), max(0, y1)
+            x2c, y2c = min(w, x2), min(h, y2)
+            crop = frame_bgr[y1c:y2c, x1c:x2c]
+            if crop.size == 0:
+                continue
+            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            face_pil = Image.fromarray(rgb).resize((160, 160), Image.BILINEAR)
+            arr = (np.asarray(face_pil).astype(np.float32) / 127.5) - 1.0  # [-1, 1]
+            tensors.append(torch.from_numpy(np.transpose(arr, (2, 0, 1))))
+            kept.append(box)
+        if not tensors:
+            return [], None
+        return kept, torch.stack(tensors)
+
+    def _detect_with_fallback(self, pil_img, frame_bgr):
+        """Detect faces with MTCNN, falling back to OpenCV cascades for profile views.
+
+        Returns (boxes, aligned_tensor, probs, detector_type):
+          - boxes: list of [x1,y1,x2,y2]
+          - aligned_tensor: (N,3,160,160) torch tensor (or None)
+          - probs: list[float] aligned with boxes (real MTCNN probs, or 0.75 for cascade)
+          - detector_type: "mtcnn" | "cascade" | "none"
+        Each call returns from exactly one detector, so detector_type applies to all boxes.
+        """
+        # 1) MTCNN — frontal / near-frontal
+        try:
+            boxes, probs = self._mtcnn.detect(pil_img)
+        except Exception:
+            boxes, probs = None, None
+        if boxes is not None and len(boxes) > 0:
+            faces = self._mtcnn(pil_img)
+            if faces is not None and len(faces) > 0:
+                # detect() and __call__() are separate passes; keep boxes/probs in
+                # lock-step with the aligned-tensor count so a face dropped during
+                # alignment can't cause an index error that loses the whole frame.
+                n = int(faces.shape[0])
+                box_list = [[int(v) for v in b] for b in boxes[:n]]
+                prob_list = [float(p) if p is not None else 0.0 for p in probs[:n]]
+                return box_list, faces, prob_list, "mtcnn"
+
+        # Fallback: OpenCV cascades
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape[:2]
+
+        # 2) profile cascade (left-facing)
+        boxes = self._cascade_faces(self._profile_cascade, gray)
+        # 3) profile cascade on flipped frame (right-facing) → map x back
+        if not boxes:
+            flipped = self._cascade_faces(self._profile_cascade, cv2.flip(gray, 1))
+            boxes = [[w - x2, y1, w - x1, y2] for (x1, y1, x2, y2) in flipped]
+        # 4) frontal cascade (catch MTCNN-missed frontals)
+        if not boxes:
+            boxes = self._cascade_faces(self._frontal_cascade, gray)
+
+        if not boxes:
+            return [], None, [], "none"
+
+        boxes, tensor = self._align_cascade_boxes(boxes, frame_bgr)
+        if tensor is None:
+            return [], None, [], "none"
+        return boxes, tensor, [0.75] * len(boxes), "cascade"
+
+    def has_face(self, frame_bgr: np.ndarray) -> bool:
+        """Fast yes/no face check for the enrollment UI (cascades only, non-blocking).
+
+        Returns False until the models/cascades are loaded (the caller warms them up
+        on a background thread), so it never blocks the UI thread with a model load.
+        """
+        if not self._models_loaded or frame_bgr is None or frame_bgr.size == 0:
+            return False
+        try:
+            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            if self._cascade_faces(self._frontal_cascade, gray):
+                return True
+            if self._cascade_faces(self._profile_cascade, gray):
+                return True
+            if self._cascade_faces(self._profile_cascade, cv2.flip(gray, 1)):
+                return True
+            return False
+        except Exception:
             return False
 
     # ------------------------------------------------------------------
@@ -92,10 +230,17 @@ class FaceRecognizer:
                 if not blob:
                     continue
                 try:
-                    emb = pickle.loads(blob)
-                    if not isinstance(emb, np.ndarray):
-                        emb = np.array(emb, dtype=np.float32)
-                    known.append((student, emb.astype(np.float32)))
+                    data = pickle.loads(blob)
+                    if isinstance(data, np.ndarray):
+                        # Legacy single-embedding format.
+                        known.append((student, data.astype(np.float32)))
+                    elif isinstance(data, list):
+                        # Multi-angle: one gallery entry per angle embedding.
+                        for emb in data:
+                            if isinstance(emb, np.ndarray):
+                                known.append((student, emb.astype(np.float32)))
+                    else:
+                        known.append((student, np.array(data, dtype=np.float32)))
                 except Exception:
                     pass
         except Exception as exc:
@@ -116,18 +261,13 @@ class FaceRecognizer:
             rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             pil = Image.fromarray(rgb)
 
-            boxes, probs = self._mtcnn.detect(pil)
-            if boxes is None or len(boxes) == 0:
+            boxes, faces, probs, _dtype = self._detect_with_fallback(pil, frame_bgr)
+            if not boxes or faces is None:
                 return None, None
 
             # Pick the face with highest detection confidence
-            best = int(np.argmax(probs))
+            best = int(np.argmax(probs)) if probs else 0
             box = [int(v) for v in boxes[best]]  # [x1, y1, x2, y2]
-
-            # Get aligned face tensor for the best face
-            faces = self._mtcnn(pil)  # (N, 3, 160, 160) or None
-            if faces is None:
-                return None, None
 
             face_tensor = faces[best].unsqueeze(0)  # (1, 3, 160, 160)
             with torch.no_grad():
@@ -166,15 +306,12 @@ class FaceRecognizer:
             try:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 pil = Image.fromarray(rgb)
-                boxes, probs = self._mtcnn.detect(pil)
-                if boxes is None or len(boxes) == 0:
+                boxes, faces, probs, _dtype = self._detect_with_fallback(pil, frame)
+                if not boxes or faces is None:
                     continue
-                idx = int(np.argmax(probs))
-                conf = float(probs[idx])
+                idx = int(np.argmax(probs)) if probs else 0
+                conf = float(probs[idx]) if probs else 0.0
 
-                faces = self._mtcnn(pil)  # aligned (N, 3, 160, 160) tensors
-                if faces is None:
-                    continue
                 with torch.no_grad():
                     emb = self._resnet(faces[idx].unsqueeze(0))[0].numpy().astype(np.float32)
                 embeddings.append(emb)
@@ -194,6 +331,35 @@ class FaceRecognizer:
             averaged = averaged / norm
         return averaged, best_box
 
+    def encode_face_multi_angle(
+        self,
+        angle_frames: dict[str, list[np.ndarray]],
+        *,
+        min_valid_per_angle: int = 2,
+    ) -> tuple[list[np.ndarray] | None, list[int] | None]:
+        """Encode faces from multiple angle captures (front/left/right).
+
+        Each angle's frame list is averaged into one unit-embedding via
+        encode_face_multi(). Returns (list_of_embeddings, best_box) — one embedding
+        per angle that had enough valid detections — or (None, None) if fewer than 2
+        angles produced an embedding (insufficient coverage for robust multi-view
+        recognition).
+        """
+        embeddings: list[np.ndarray] = []
+        best_box: list[int] | None = None
+
+        for angle, frames in angle_frames.items():
+            emb, box = self.encode_face_multi(frames, min_valid=min_valid_per_angle)
+            if emb is not None:
+                embeddings.append(emb)
+                if best_box is None:
+                    best_box = box  # first valid box → preview photo
+
+        if len(embeddings) < 2:
+            return None, None
+
+        return embeddings, best_box
+
     def recognize_faces(self, frame_bgr: np.ndarray) -> list[dict]:
         """Detect ALL faces in frame and identify each against enrolled students.
 
@@ -208,12 +374,8 @@ class FaceRecognizer:
             rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             pil = Image.fromarray(rgb)
 
-            boxes, probs = self._mtcnn.detect(pil)
-            if boxes is None or len(boxes) == 0:
-                return []
-
-            faces = self._mtcnn(pil)
-            if faces is None:
+            boxes, faces, probs, detector_type = self._detect_with_fallback(pil, frame_bgr)
+            if not boxes or faces is None:
                 return []
 
             with self._lock:
@@ -223,8 +385,12 @@ class FaceRecognizer:
             with torch.no_grad():
                 embeddings = self._resnet(faces)  # (N, 512)
 
-            for i, (box, prob) in enumerate(zip(boxes, probs)):
-                if prob < 0.85:
+            for i, box in enumerate(boxes):
+                if i >= embeddings.shape[0]:
+                    break  # never index past the aligned-tensor batch (count safety)
+                # The 0.85 confidence gate applies to MTCNN only; cascade fallback
+                # detections have no real score (0.75) but are still usable.
+                if detector_type == "mtcnn" and i < len(probs) and probs[i] < 0.85:
                     continue
                 emb = embeddings[i].numpy().astype(np.float32)
                 box_int = [int(v) for v in box]
@@ -246,6 +412,7 @@ class FaceRecognizer:
                     "student_id": sid,
                     "gender": gender,
                     "matched": matched,
+                    "detector_type": detector_type,
                 })
 
             return results

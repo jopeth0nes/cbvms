@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pickle
+import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import TYPE_CHECKING, Callable
@@ -22,6 +23,7 @@ from ui.components import (
     COLOR_SURFACE,
     COLOR_TEXT,
     COLOR_TEXT_MUTED,
+    COLOR_WARNING,
     CORNER_RADIUS,
     PADDING,
     body_font,
@@ -34,6 +36,15 @@ if TYPE_CHECKING:
 
 PREVIEW_WIDTH = 320
 PREVIEW_HEIGHT = 240
+
+# Guided multi-angle capture order (angle_key, on-screen instruction).
+_ANGLES = [
+    ("front", "Look straight at the camera"),
+    ("left", "Slowly turn your head LEFT"),
+    ("right", "Slowly turn your head RIGHT"),
+]
+_ENROLL_FINISH_TEXT = "✓ All Angles Done — Enroll Student"
+_UPDATE_FINISH_TEXT = "✓ All Angles Done — Update Photo"
 
 
 class EnrollmentPanel(ctk.CTkFrame):
@@ -474,41 +485,24 @@ class EnrollmentPanel(ctk.CTkFrame):
         )
         self._enroll_status_label.pack(anchor="w", padx=PADDING, pady=(0, PADDING))
 
-        # RIGHT — live camera preview
+        # RIGHT — guided multi-angle capture wizard
         cam_card = ctk.CTkFrame(modal, fg_color=COLOR_SURFACE, corner_radius=CORNER_RADIUS,
                                 border_width=1, border_color=COLOR_BORDER)
         cam_card.grid(row=1, column=1, sticky="nsew", padx=(8, PADDING), pady=(0, 8))
-        ctk.CTkLabel(cam_card, text="Camera Preview", font=body_font(12),
-                     text_color=COLOR_TEXT_MUTED).pack(anchor="w", padx=12, pady=(12, 6))
-        canvas = tk.Canvas(cam_card, width=PREVIEW_WIDTH, height=PREVIEW_HEIGHT,
-                           bg=COLOR_BG, highlightthickness=0, borderwidth=0)
-        canvas.pack(padx=12, pady=(0, 12))
 
-        state: dict = {"job": None, "img": None, "item": None}
-
-        def _tick() -> None:
-            if not modal.winfo_exists():
-                return
-            frame = self.get_frame()
-            if frame is not None:
-                disp = cv2.resize(frame, (PREVIEW_WIDTH, PREVIEW_HEIGHT))
-                rgb = np.ascontiguousarray(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB))
-                pil = Image.fromarray(rgb)
-                photo = ImageTk.PhotoImage(image=pil, master=canvas)
-                state["img"] = photo
-                if state["item"] is None:
-                    state["item"] = canvas.create_image(0, 0, anchor=tk.NW, image=photo)
-                else:
-                    canvas.itemconfig(state["item"], image=photo)
-            state["job"] = modal.after(50, _tick)
+        state: dict = {
+            "modal": modal, "step": 0, "angle_frames": {}, "capturing": False, "alive": True,
+        }
 
         def _close() -> None:
-            if state["job"] is not None:
-                try:
-                    modal.after_cancel(state["job"])
-                except Exception:
-                    pass
-                state["job"] = None
+            state["alive"] = False
+            for job_key in ("job_tick", "job_detect"):
+                if state.get(job_key) is not None:
+                    try:
+                        modal.after_cancel(state[job_key])
+                    except Exception:
+                        pass
+                    state[job_key] = None
             try:
                 modal.grab_release()
             except Exception:
@@ -517,24 +511,21 @@ class EnrollmentPanel(ctk.CTkFrame):
             self._enroll_close = None
             modal.destroy()
 
+        state["close"] = _close
         self._enroll_close = _close
+
+        self._build_capture_wizard(
+            cam_card, state, on_finish=self._finish_enroll, finish_text=_ENROLL_FINISH_TEXT,
+        )
 
         btns = ctk.CTkFrame(modal, fg_color="transparent")
         btns.grid(row=2, column=0, columnspan=2, sticky="ew", padx=PADDING, pady=(0, PADDING))
-        btns.grid_columnconfigure(0, weight=1)
-
-        self._enroll_capture_btn = ctk.CTkButton(
-            btns, text="Capture & Enroll", height=40, corner_radius=CORNER_RADIUS,
-            fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, command=self._capture_and_enroll,
-        )
-        self._enroll_capture_btn.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         ctk.CTkButton(
-            btns, text="Cancel", width=130, height=40, corner_radius=CORNER_RADIUS,
-            fg_color=COLOR_BORDER, hover_color="#DC2626", command=_close,
-        ).grid(row=0, column=1)
+            btns, text="Cancel", width=130, height=36, corner_radius=CORNER_RADIUS,
+            fg_color=COLOR_BORDER, hover_color=COLOR_DANGER, command=_close,
+        ).pack(side="right")
 
         modal.protocol("WM_DELETE_WINDOW", _close)
-        _tick()
 
     def _clear_form(self) -> None:
         for entry in self._entries.values():
@@ -543,91 +534,370 @@ class EnrollmentPanel(ctk.CTkFrame):
             except Exception:
                 pass
 
-    def _capture_and_enroll(self) -> None:
+    # ------------------------------------------------------------------
+    # Guided multi-angle capture wizard (shared by enroll + update)
+    # ------------------------------------------------------------------
+
+    def _build_capture_wizard(self, card, state: dict, *, on_finish, finish_text: str) -> None:
+        """Build the 3-step front/left/right capture UI into `card`.
+
+        `state` carries: modal, step, angle_frames, capturing, alive, widget refs.
+        `on_finish(modal, state)` runs once all angles are captured/skipped.
+        """
+        # Warm up the recognizer models (for the live "face detected" indicator) without
+        # blocking the UI thread — has_face() returns False until this finishes.
+        if self.recognizer is not None:
+            threading.Thread(target=self.recognizer._ensure_models, daemon=True).start()
+
+        # Step indicator (3 circles + caption)
+        ind = ctk.CTkFrame(card, fg_color="transparent")
+        ind.pack(fill="x", padx=12, pady=(12, 2))
+        crow = ctk.CTkFrame(ind, fg_color="transparent")
+        crow.pack()
+        circles = []
+        for i in range(3):
+            c = ctk.CTkLabel(crow, text=str(i + 1), width=30, height=30, corner_radius=15,
+                             fg_color=COLOR_BORDER, text_color=COLOR_TEXT_MUTED, font=body_font(13))
+            c.pack(side="left", padx=6)
+            circles.append(c)
+        step_caption = ctk.CTkLabel(ind, text="", font=body_font(12), text_color=COLOR_TEXT)
+        step_caption.pack(pady=(6, 0))
+        state["circles"] = circles
+        state["step_caption"] = step_caption
+
+        # Live preview canvas (pose-guide overlay drawn each tick)
+        canvas = tk.Canvas(card, width=PREVIEW_WIDTH, height=PREVIEW_HEIGHT,
+                           bg=COLOR_BG, highlightthickness=0, borderwidth=0)
+        canvas.pack(padx=12, pady=(8, 6))
+        state["canvas"] = canvas
+        state["canvas_item"] = None
+        state["img"] = None
+
+        # Detection status (dot + text)
+        srow = ctk.CTkFrame(card, fg_color="transparent")
+        srow.pack(pady=(0, 6))
+        dot = ctk.CTkLabel(srow, text="●", font=body_font(14), text_color=COLOR_TEXT_MUTED)
+        dot.pack(side="left", padx=(0, 6))
+        det_status = ctk.CTkLabel(srow, text="Loading model…", font=body_font(12),
+                                  text_color=COLOR_TEXT_MUTED)
+        det_status.pack(side="left")
+        state["dot"] = dot
+        state["det_status"] = det_status
+
+        # Capture + skip
+        cap_btn = ctk.CTkButton(
+            card, text="Capture This Angle", height=40, corner_radius=CORNER_RADIUS,
+            fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER,
+            command=lambda: self._wizard_capture(state, on_finish, finish_text),
+        )
+        cap_btn.pack(fill="x", padx=12, pady=(2, 4))
+        state["cap_btn"] = cap_btn
+        skip_btn = ctk.CTkButton(
+            card, text="Skip this angle →", height=24, corner_radius=CORNER_RADIUS,
+            fg_color="transparent", hover_color=COLOR_BORDER, text_color=COLOR_TEXT_MUTED,
+            font=body_font(11), command=lambda: self._wizard_skip(state, on_finish, finish_text),
+        )
+        skip_btn.pack(padx=12, pady=(0, 6))
+        state["skip_btn"] = skip_btn
+
+        # Progress pills
+        prow = ctk.CTkFrame(card, fg_color="transparent")
+        prow.pack(pady=(0, 10))
+        pills = {}
+        for key, _instr in _ANGLES:
+            p = ctk.CTkLabel(prow, text=f"{key.title()}: 0", font=body_font(11),
+                             text_color=COLOR_TEXT_MUTED, fg_color=COLOR_BG,
+                             corner_radius=999, padx=8, pady=2)
+            p.pack(side="left", padx=4)
+            pills[key] = p
+        state["pills"] = pills
+
+        self._wizard_refresh(state, finish_text)
+        self._wizard_tick(state)
+        self._wizard_detect(state)
+
+    @staticmethod
+    def _draw_pose_guide(disp, step: int):
+        """Draw a face-oval guide (+ direction arrow) onto the preview frame in place."""
+        h, w = disp.shape[:2]
+        cx, cy = w // 2, h // 2
+        if step == 1:        # turn LEFT → guide oval shifts right
+            center = (cx + 30, cy)
+        elif step == 2:      # turn RIGHT → guide oval shifts left
+            center = (cx - 30, cy)
+        else:
+            center = (cx, cy)
+        cv2.ellipse(disp, center, (60, 80), 0, 0, 360, (255, 255, 255), 2)
+        # cv2 (Hershey) fonts are ASCII-only, so use "<-"/"->" for the arrows.
+        if step == 1:
+            cv2.putText(disp, "<-", (cx - 95, cy + 8), cv2.FONT_HERSHEY_SIMPLEX,
+                        1.0, (255, 255, 255), 2, cv2.LINE_AA)
+        elif step == 2:
+            cv2.putText(disp, "->", (cx + 60, cy + 8), cv2.FONT_HERSHEY_SIMPLEX,
+                        1.0, (255, 255, 255), 2, cv2.LINE_AA)
+        return disp
+
+    def _wizard_tick(self, state: dict) -> None:
+        modal = state["modal"]
+        if not modal.winfo_exists() or not state.get("alive", True):
+            return
+        frame = self.get_frame()
+        if frame is not None:
+            disp = cv2.resize(frame, (PREVIEW_WIDTH, PREVIEW_HEIGHT))
+            self._draw_pose_guide(disp, state["step"])
+            rgb = np.ascontiguousarray(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB))
+            photo = ImageTk.PhotoImage(image=Image.fromarray(rgb), master=state["canvas"])
+            state["img"] = photo
+            if state["canvas_item"] is None:
+                state["canvas_item"] = state["canvas"].create_image(0, 0, anchor=tk.NW, image=photo)
+            else:
+                state["canvas"].itemconfig(state["canvas_item"], image=photo)
+        state["job_tick"] = modal.after(50, lambda: self._wizard_tick(state))
+
+    def _wizard_detect(self, state: dict) -> None:
+        modal = state["modal"]
+        if not modal.winfo_exists() or not state.get("alive", True):
+            return
+        if not state.get("capturing"):
+            frame = self.get_frame()
+            rec = self.recognizer
+            if rec is None or not getattr(rec, "_models_loaded", False):
+                state["dot"].configure(text_color=COLOR_TEXT_MUTED)
+                state["det_status"].configure(text="Loading model…", text_color=COLOR_TEXT_MUTED)
+            elif frame is not None and rec.has_face(frame):
+                state["dot"].configure(text_color=COLOR_SAFE)
+                state["det_status"].configure(text="Face detected ✓", text_color=COLOR_SAFE)
+            else:
+                state["dot"].configure(text_color=COLOR_DANGER)
+                state["det_status"].configure(
+                    text="No face detected — adjust your position", text_color=COLOR_DANGER)
+        state["job_detect"] = modal.after(200, lambda: self._wizard_detect(state))
+
+    def _update_pills(self, state: dict) -> None:
+        for key, pill in state["pills"].items():
+            n = len(state["angle_frames"].get(key, []))
+            color = COLOR_SAFE if n >= 2 else COLOR_WARNING if n == 1 else COLOR_TEXT_MUTED
+            pill.configure(text=f"{key.title()}: {n}", text_color=color)
+
+    def _wizard_refresh(self, state: dict, finish_text: str) -> None:
+        step = state["step"]
+        for i, c in enumerate(state["circles"]):
+            if i < step:
+                c.configure(text="✓", fg_color=COLOR_SAFE, text_color=COLOR_TEXT)
+            elif i == step:
+                c.configure(text=str(i + 1), fg_color=COLOR_ACCENT, text_color=COLOR_TEXT)
+            else:
+                c.configure(text=str(i + 1), fg_color=COLOR_BORDER, text_color=COLOR_TEXT_MUTED)
+        instr = _ANGLES[step][1] if step < len(_ANGLES) else ""
+        state["step_caption"].configure(text=f"Step {min(step + 1, 3)} of 3 — {instr}")
+        is_last = step >= len(_ANGLES) - 1
+        state["cap_btn"].configure(text=finish_text if is_last else "Capture This Angle",
+                                   state="normal")
+        state["skip_btn"].configure(state="normal")
+        self._update_pills(state)
+
+    def _wizard_capture(self, state: dict, on_finish, finish_text: str) -> None:
+        if state.get("capturing") or state["step"] >= len(_ANGLES):
+            return
+        angle_key = _ANGLES[state["step"]][0]
+        state["capturing"] = True
+        state["cap_btn"].configure(state="disabled")
+        state["skip_btn"].configure(state="disabled")
+        state["dot"].configure(text_color=COLOR_TEXT_MUTED)
+        state["det_status"].configure(text="Capturing… hold still", text_color=COLOR_TEXT_MUTED)
+
+        def _done(frames) -> None:
+            if not state["modal"].winfo_exists():
+                return
+            good = [f for f in frames if f is not None]
+            state["angle_frames"].setdefault(angle_key, []).extend(good)
+            state["det_status"].configure(text=f"✓ {len(good)} frames captured", text_color=COLOR_SAFE)
+            self._update_pills(state)
+            state["modal"].after(800, lambda: self._wizard_next(state, on_finish, finish_text))
+
+        self._collect_frames(_done, count=8, interval_ms=120)
+
+    def _wizard_skip(self, state: dict, on_finish, finish_text: str) -> None:
+        if state.get("capturing"):
+            return
+        is_last = state["step"] >= len(_ANGLES) - 1
+        total = sum(len(v) for v in state["angle_frames"].values())
+        if is_last and total == 0:
+            state["dot"].configure(text_color=COLOR_DANGER)
+            state["det_status"].configure(
+                text="Capture at least one angle before finishing.", text_color=COLOR_DANGER)
+            return
+        self._wizard_next(state, on_finish, finish_text)
+
+    def _wizard_next(self, state: dict, on_finish, finish_text: str) -> None:
+        state["capturing"] = False
+        state["step"] += 1
+        if state["step"] >= len(_ANGLES):
+            on_finish(state["modal"], state)
+            return
+        self._wizard_refresh(state, finish_text)
+
+    @staticmethod
+    def _first_frame(angle_frames: dict):
+        for key, _instr in _ANGLES:
+            for f in reversed(angle_frames.get(key, [])):
+                if f is not None:
+                    return f
+        for frames in angle_frames.values():
+            for f in reversed(frames):
+                if f is not None:
+                    return f
+        return None
+
+    @staticmethod
+    def _crop_photo(frame, box) -> bytes:
+        if frame is None:
+            return b""
+        crop = frame
+        if box is not None:
+            h, w = frame.shape[:2]
+            x1, y1, x2, y2 = [max(0, int(v)) for v in box]
+            x2, y2 = min(w, x2), min(h, y2)
+            sub = frame[y1:y2, x1:x2]
+            if sub.size > 0:
+                crop = sub
+        ok, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        return buf.tobytes() if ok else b""
+
+    def _wizard_embed(self, angle_frames: dict):
+        """Encode captured angles → (encoding_blob, best_box) or (None, None)."""
+        non_empty = {k: v for k, v in angle_frames.items() if v}
+        if len(non_empty) >= 2:
+            embeddings, box = self.recognizer.encode_face_multi_angle(
+                non_empty, min_valid_per_angle=2)
+            if embeddings is None:
+                return None, None
+            return pickle.dumps(embeddings), box
+        frames = next(iter(non_empty.values()))
+        emb, box = self.recognizer.encode_face_multi(frames, min_valid=2)
+        if emb is None:
+            return None, None
+        return pickle.dumps(emb), box
+
+    def _finish_enroll(self, modal, state: dict) -> None:
+        angle_frames = {k: v for k, v in state["angle_frames"].items() if v}
+        if not angle_frames:
+            self._set_enroll_status("Please capture at least one angle.", error=True)
+            state["step"] = 0
+            self._wizard_refresh(state, _ENROLL_FINISH_TEXT)
+            return
         if not self._entries or self._gender_var is None:
             return
+
         name = self._entries["name"].get().strip()
         student_id = self._entries["student_id"].get().strip()
         course = self._entries["course"].get().strip()
         year_and_section = self._entries["year_and_section"].get().strip()
         gender = self._gender_var.get()
 
+        def _rearm(msg: str) -> None:
+            state["capturing"] = False
+            self._set_enroll_status(msg, error=True)
+            if modal.winfo_exists():
+                state["step"] = 0
+                self._wizard_refresh(state, _ENROLL_FINISH_TEXT)
+
         if not all([name, student_id, course, year_and_section]):
-            self._set_enroll_status("Please fill in all fields.", error=True)
+            _rearm("Please fill in all fields.")
             return
         if self.database.student_id_exists(student_id):
-            self._set_enroll_status(f"Student ID '{student_id}' is already enrolled.", error=True)
+            _rearm(f"Student ID '{student_id}' is already enrolled.")
             return
         if self.recognizer is None:
-            self._set_enroll_status("Face recognition not ready.", error=True)
-            return
-        if self.get_frame() is None:
-            self._set_enroll_status("Camera unavailable.", error=True)
+            _rearm("Face recognition not ready.")
             return
 
-        # Collect 10 frames over ~1s, then average the embeddings.
-        btn = getattr(self, "_enroll_capture_btn", None)
-        if btn is not None:
-            btn.configure(state="disabled")
-        self._set_enroll_status("Capturing frames… hold still")
-        self._collect_frames(
-            lambda frames: self._finish_enroll(
-                frames, name, student_id, course, year_and_section, gender
-            )
-        )
+        # Mark busy so the 200ms detect loop stops overwriting the status while encoding.
+        state["capturing"] = True
+        state["cap_btn"].configure(text="Enrolling…", state="disabled")
+        state["skip_btn"].configure(state="disabled")
+        self._set_enroll_status("Encoding faces and enrolling…")
 
-    def _finish_enroll(self, frames, name, student_id, course, year_and_section, gender) -> None:
-        btn = getattr(self, "_enroll_capture_btn", None)
+        def _do_enroll() -> None:
+            blob, box = self._wizard_embed(angle_frames)
+            if blob is None:
+                modal.after(0, lambda: _rearm(
+                    "Could not get enough face detections. Try again in better lighting."))
+                return
+            photo = self._crop_photo(self._first_frame(angle_frames), box)
+            try:
+                self.database.insert_student(
+                    student_id=student_id, name=name, course=course,
+                    year_and_section=year_and_section, gender=gender,
+                    encoding=blob, photo=photo,
+                )
+            except Exception as exc:
+                modal.after(0, lambda e=exc: _rearm(f"Enrollment failed: {e}"))
+                return
+            modal.after(0, _on_success)
 
-        def _fail(msg: str) -> None:
-            self._set_enroll_status(msg, error=True)
-            if btn is not None and btn.winfo_exists():
-                btn.configure(state="normal")
+        def _on_success() -> None:
+            self._clear_form()
+            self._reload_students()
+            self.recognizer.load_known_faces()
+            self._set_status("Student enrolled successfully.", success=True)
+            close = state.get("close")
+            if close is not None:
+                close()
 
-        if self.recognizer is None:
-            _fail("Face recognition not ready.")
+        threading.Thread(target=_do_enroll, daemon=True).start()
+
+    def _finish_update(self, modal, state: dict) -> None:
+        angle_frames = {k: v for k, v in state["angle_frames"].items() if v}
+        if not angle_frames:
+            state["dot"].configure(text_color=COLOR_DANGER)
+            state["det_status"].configure(text="Capture at least one angle.", text_color=COLOR_DANGER)
+            state["step"] = 0
+            self._wizard_refresh(state, _UPDATE_FINISH_TEXT)
             return
+        pk = state["target_pk"]
 
-        self._set_enroll_status("Processing…")
-        embedding, box = self.recognizer.encode_face_multi(frames, min_valid=3)
-        if embedding is None or box is None:
-            _fail("Could not detect a stable face. Ensure good lighting and hold still.")
-            return
+        def _rearm(msg: str) -> None:
+            state["capturing"] = False
+            if not modal.winfo_exists():
+                return
+            state["dot"].configure(text_color=COLOR_DANGER)
+            state["det_status"].configure(text=msg, text_color=COLOR_DANGER)
+            state["step"] = 0
+            self._wizard_refresh(state, _UPDATE_FINISH_TEXT)
 
-        last = next((f for f in reversed(frames) if f is not None), None)
-        if last is None:
-            _fail("Camera unavailable.")
-            return
+        # Mark busy so the 200ms detect loop stops overwriting the status while encoding.
+        state["capturing"] = True
+        state["cap_btn"].configure(text="Updating…", state="disabled")
+        state["skip_btn"].configure(state="disabled")
+        state["det_status"].configure(text="Encoding faces…", text_color=COLOR_TEXT_MUTED)
 
-        x1, y1, x2, y2 = [max(0, int(v)) for v in box]
-        face_crop = last[y1:y2, x1:x2]
-        if face_crop.size == 0:
-            face_crop = last
-        ok, buf = cv2.imencode(".jpg", face_crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-        if not ok:
-            _fail("Failed to encode photo.")
-            return
+        def _do_update() -> None:
+            blob, box = self._wizard_embed(angle_frames)
+            if blob is None:
+                modal.after(0, lambda: _rearm(
+                    "Could not get enough face detections. Better lighting helps."))
+                return
+            photo = self._crop_photo(self._first_frame(angle_frames), box)
+            ok = self.database.update_student_encoding(pk, blob, photo)
+            modal.after(0, lambda: _on_done(ok, photo))
 
-        try:
-            self.database.insert_student(
-                student_id=student_id,
-                name=name,
-                course=course,
-                year_and_section=year_and_section,
-                gender=gender,
-                encoding=pickle.dumps(embedding),
-                photo=buf.tobytes(),
-            )
-        except Exception as exc:
-            _fail(f"Enrollment failed: {exc}")
-            return
+        def _on_done(ok: bool, photo: bytes) -> None:
+            if not ok:
+                _rearm("Update failed.")
+                return
+            self.recognizer.load_known_faces()
+            self._reload_students()
+            try:
+                self._show_photo_bytes(photo, self._selected_photo_label)
+            except Exception:
+                pass
+            self._set_status("Photo updated successfully.", success=True)
+            close = state.get("close")
+            if close is not None:
+                close()
 
-        self._clear_form()
-        self._reload_students()
-        self.recognizer.load_known_faces()
-        self._set_status("Student enrolled successfully.", success=True)
-        if self._enroll_close is not None:
-            self._enroll_close()
+        threading.Thread(target=_do_update, daemon=True).start()
 
     # ------------------------------------------------------------------
     # Delete
@@ -719,9 +989,7 @@ class EnrollmentPanel(ctk.CTkFrame):
         self._open_update_modal(student)
 
     def _open_update_modal(self, student: dict) -> None:
-        PV_W, PV_H = 320, 240
         target_pk = int(student["id"])
-        state: dict = {"job": None, "img": None, "preview_on": True, "capturing": False}
 
         modal = ctk.CTkToplevel(self)
         modal.title(f"Update Photo — {student.get('name', '')}")
@@ -730,118 +998,43 @@ class EnrollmentPanel(ctk.CTkFrame):
         modal.transient(self.winfo_toplevel())
         modal.update_idletasks()
         sw, sh = modal.winfo_screenwidth(), modal.winfo_screenheight()
-        modal.geometry(f"480x360+{(sw - 480) // 2}+{(sh - 360) // 2}")
+        W, H = 480, 640
+        modal.geometry(f"{W}x{H}+{(sw - W) // 2}+{(sh - H) // 2}")
         modal.after(120, modal.lift)
         modal.after(200, lambda: self._safe_grab(modal))
 
-        # Rounded content card
         card = ctk.CTkFrame(modal, fg_color=COLOR_SURFACE, corner_radius=16,
                             border_width=1, border_color=COLOR_BORDER)
         card.pack(fill="both", expand=True, padx=PADDING, pady=PADDING)
-
         ctk.CTkLabel(
             card, text=student.get("name", ""), font=heading_font(16), text_color=COLOR_TEXT,
-        ).pack(pady=(PADDING, 6))
+        ).pack(pady=(PADDING, 2))
 
-        # Live preview — tk.Label (crash-safe with ImageTk reassignment)
-        preview_wrap = ctk.CTkFrame(card, fg_color=COLOR_BG, corner_radius=CORNER_RADIUS)
-        preview_wrap.pack(padx=PADDING, pady=(0, 8))
-        preview_label = tk.Label(
-            preview_wrap, text="Starting camera…", bd=0,
-            bg=COLOR_BG, fg=COLOR_TEXT_MUTED, width=44, height=12,
-        )
-        preview_label.pack(padx=6, pady=6)
-
-        status_lbl = ctk.CTkLabel(
-            card, text="Look at the camera, then Capture & Update.",
-            font=body_font(12), text_color=COLOR_TEXT_MUTED,
-        )
-
-        def _preview() -> None:
-            if not modal.winfo_exists() or not state["preview_on"]:
-                return
-            frame = self.get_frame()
-            if frame is not None:
-                img = self._frame_to_photo(frame, PV_W, PV_H)
-                if img is not None:
-                    state["img"] = img
-                    preview_label.configure(image=img, text="", width=PV_W, height=PV_H)
-            else:
-                preview_label.configure(image="", text="Camera unavailable")
-            state["job"] = modal.after(50, _preview)
+        state: dict = {
+            "modal": modal, "step": 0, "angle_frames": {}, "capturing": False,
+            "alive": True, "target_pk": target_pk,
+        }
 
         def _close() -> None:
-            state["preview_on"] = False
-            if state["job"] is not None:
-                try:
-                    modal.after_cancel(state["job"])
-                except Exception:
-                    pass
-                state["job"] = None
+            state["alive"] = False
+            for job_key in ("job_tick", "job_detect"):
+                if state.get(job_key) is not None:
+                    try:
+                        modal.after_cancel(state[job_key])
+                    except Exception:
+                        pass
+                    state[job_key] = None
             try:
                 modal.grab_release()
             except Exception:
                 pass
             modal.destroy()
 
-        def _finish(frames) -> None:
-            # The modal may have been cancelled during the ~1s frame capture
-            # (_collect_frames only guards the panel, not this modal).
-            if not modal.winfo_exists():
-                return
+        state["close"] = _close
 
-            def _retry(msg: str) -> None:
-                status_lbl.configure(text=msg, text_color=COLOR_DANGER)
-                if capture_btn.winfo_exists():
-                    capture_btn.configure(state="normal")
-                state["capturing"] = False
-
-            status_lbl.configure(text="Processing…", text_color=COLOR_TEXT_MUTED)
-            modal.update_idletasks()
-            embedding, box = self.recognizer.encode_face_multi(frames, min_valid=3)
-            if embedding is None or box is None:
-                _retry("Could not detect a stable face. Ensure good lighting and hold still.")
-                return
-            last = next((f for f in reversed(frames) if f is not None), None)
-            if last is None:
-                _retry("Camera unavailable.")
-                return
-            x1, y1, x2, y2 = [max(0, int(v)) for v in box]
-            crop = last[y1:y2, x1:x2]
-            if crop.size == 0:
-                crop = last
-            ok, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-            if not ok:
-                _retry("Failed to encode photo.")
-                return
-            if self.database.update_student_encoding(target_pk, pickle.dumps(embedding), buf.tobytes()):
-                self.recognizer.load_known_faces()
-                self._reload_students()
-                try:
-                    self._show_photo_bytes(buf.tobytes(), self._selected_photo_label)
-                except Exception:
-                    pass
-                self._set_status("Photo updated successfully.", success=True)
-                _close()
-            else:
-                _retry("Update failed.")
-
-        def _capture() -> None:
-            if state["capturing"]:
-                return
-            state["capturing"] = True
-            capture_btn.configure(state="disabled")
-            status_lbl.configure(text="Capturing… hold still", text_color=COLOR_TEXT_MUTED)
-            self._collect_frames(_finish)
-
-        capture_btn = ctk.CTkButton(
-            card, text="📷  Capture & Update", height=44, corner_radius=12,
-            fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, font=body_font(14),
-            command=_capture,
+        self._build_capture_wizard(
+            card, state, on_finish=self._finish_update, finish_text=_UPDATE_FINISH_TEXT,
         )
-        capture_btn.pack(fill="x", padx=PADDING, pady=(2, 6))
-
-        status_lbl.pack(pady=(0, 6))
 
         ctk.CTkButton(
             card, text="Cancel", height=30, corner_radius=CORNER_RADIUS,
@@ -850,4 +1043,3 @@ class EnrollmentPanel(ctk.CTkFrame):
         ).pack(pady=(0, PADDING))
 
         modal.protocol("WM_DELETE_WINDOW", _close)
-        _preview()
