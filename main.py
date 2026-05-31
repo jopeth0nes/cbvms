@@ -21,10 +21,16 @@ def main() -> None:
 
     auth = AuthManager(database)
 
-    def on_login_success(username: str) -> None:
-        open_dashboard(username=username)
-
-    run_login(auth, on_login_success)
+    # Loop: login -> dashboard -> (logout) -> login -> ...
+    # Exits only when the login window is closed or the dashboard is closed
+    # directly (not via Logout).
+    while True:
+        username = run_login(auth)
+        if not username:
+            break  # login window closed
+        logged_out = open_dashboard(username=username)
+        if not logged_out:
+            break  # dashboard closed/exited directly
 
 
 if __name__ == "__main__":

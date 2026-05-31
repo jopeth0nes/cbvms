@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import colorsys
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -10,8 +11,11 @@ from typing import TYPE_CHECKING
 
 import customtkinter as ctk
 
+from core.trainer import MODULES
+
 if TYPE_CHECKING:
     from core.recognizer import Recognizer
+    from core.trainer import ViolationTrainer
     from core.violation_engine import ViolationEngine
 
 from database.db_manager import CBVMSDatabase
@@ -58,12 +62,14 @@ class SettingsPanel(ctk.CTkFrame):
         get_detector_loaded: Callable[[], bool],
         apply_camera_settings: Callable[[int, tuple[int, int], int], None],
         on_camera_source_connected: Callable[[dict], None] | None = None,
+        trainer: "ViolationTrainer | None" = None,
         **kwargs,
     ) -> None:
         super().__init__(master, fg_color=COLOR_BG, **kwargs)
         self.database = database
         self.recognizer = recognizer
         self.violation_engine = violation_engine
+        self.trainer = trainer
         self.username = username
         self.get_detector_loaded = get_detector_loaded
         self.apply_camera_settings = apply_camera_settings
@@ -321,25 +327,55 @@ class SettingsPanel(ctk.CTkFrame):
             except Exception:
                 pass
 
+    _CLASSIFIER_TITLES = {"uniform": "Uniform Check", "earring": "Earring Check"}
+
     def _model_status_section(self, master, *, row: int) -> int:
         card = self._section_card(master, "Model Status")
         card.grid(row=row, column=0, sticky="ew", padx=PADDING, pady=(0, 12))
         card.grid_columnconfigure(0, weight=1)
 
-        self._model_rows: dict[str, ctk.CTkLabel] = {}
-        for name in ("yolov8n.pt", "earring_model.pth", "uniform_model.pth"):
-            r = ctk.CTkFrame(card, fg_color="transparent")
-            r.pack(fill="x", padx=PADDING, pady=4)
-            ctk.CTkLabel(r, text=name, font=body_small_font(), text_color=COLOR_TEXT).pack(side="left")
-            status = ctk.CTkLabel(r, text="—", font=body_small_font(), text_color=COLOR_TEXT_MUTED)
-            status.pack(side="right")
-            self._model_rows[name] = status
+        # Person detector (YOLOv8) — single-line status
+        det_row = ctk.CTkFrame(card, fg_color="transparent")
+        det_row.pack(fill="x", padx=PADDING, pady=4)
+        ctk.CTkLabel(
+            det_row, text="Person Detector  ·  yolov8n.pt",
+            font=body_small_font(), text_color=COLOR_TEXT,
+        ).pack(side="left")
+        self._detector_status_label = ctk.CTkLabel(
+            det_row, text="—", font=body_small_font(), text_color=COLOR_TEXT_MUTED,
+        )
+        self._detector_status_label.pack(side="right")
+
+        # Trainable classifiers (uniform / earring)
+        self._cls_status: dict[str, dict] = {}
+        for module in ("uniform", "earring"):
+            title = self._CLASSIFIER_TITLES[module]
+            model_file = Path(MODULES[module]["model_out"]).name
+
+            top = ctk.CTkFrame(card, fg_color="transparent")
+            top.pack(fill="x", padx=PADDING, pady=(8, 0))
+            ctk.CTkLabel(
+                top, text=f"{title}  ·  {model_file}",
+                font=body_small_font(), text_color=COLOR_TEXT,
+            ).pack(side="left")
+            badge = ctk.CTkLabel(
+                top, text="—", font=body_small_font(), text_color=COLOR_TEXT_MUTED,
+            )
+            badge.pack(side="right")
+
+            detail = ctk.CTkLabel(
+                card, text="", font=body_small_font(), text_color=COLOR_TEXT_MUTED,
+                anchor="w", justify="left",
+            )
+            detail.pack(fill="x", padx=PADDING, pady=(0, 2))
+
+            self._cls_status[module] = {"badge": badge, "detail": detail}
 
         btns = ctk.CTkFrame(card, fg_color="transparent")
         btns.pack(fill="x", padx=PADDING, pady=(10, PADDING))
         ctk.CTkButton(
             btns,
-            text="Open Training Guide",
+            text="Training Guide",
             height=34,
             corner_radius=CORNER_RADIUS,
             fg_color=COLOR_BORDER,
@@ -360,36 +396,36 @@ class SettingsPanel(ctk.CTkFrame):
         return row + 1
 
     def _refresh_model_status(self) -> None:
-        project_root = Path(__file__).resolve().parents[1]
-        models_dir = project_root / "models"
-
-        yolov8 = models_dir / "yolov8n.pt"
-        earring = models_dir / "earring_model.pth"
-        uniform = models_dir / "uniform_model.pth"
-
-        def _set(name: str, text: str, color: str) -> None:
-            if name in self._model_rows:
-                self._model_rows[name].configure(text=text, text_color=color)
-
-        _set(
-            "yolov8n.pt",
-            "Loaded" if self.get_detector_loaded() else ("Not found" if not yolov8.exists() else "Not loaded"),
-            COLOR_SAFE if self.get_detector_loaded() else (COLOR_DANGER if not yolov8.exists() else COLOR_WARNING),
+        # Person detector
+        yolov8 = Path(__file__).resolve().parents[1] / "models" / "yolov8n.pt"
+        loaded = self.get_detector_loaded()
+        self._detector_status_label.configure(
+            text="Loaded" if loaded else ("Not found" if not yolov8.exists() else "Not loaded"),
+            text_color=COLOR_SAFE if loaded else (COLOR_DANGER if not yolov8.exists() else COLOR_WARNING),
         )
 
-        uniform_loaded = getattr(self.violation_engine, "_uniform_model", None) is not None
-        earring_loaded = getattr(self.violation_engine, "_earring_model", None) is not None
+        # Trainable classifiers
+        for module, refs in getattr(self, "_cls_status", {}).items():
+            if self.trainer is None:
+                refs["badge"].configure(text="Unavailable", text_color=COLOR_TEXT_MUTED)
+                refs["detail"].configure(text="")
+                continue
 
-        _set(
-            "earring_model.pth",
-            "Loaded" if earring_loaded else ("Not trained yet" if not earring.exists() else "Not trained yet"),
-            COLOR_SAFE if earring_loaded else COLOR_WARNING,
-        )
-        _set(
-            "uniform_model.pth",
-            "Loaded" if uniform_loaded else ("Not trained yet" if not uniform.exists() else "Not trained yet"),
-            COLOR_SAFE if uniform_loaded else COLOR_WARNING,
-        )
+            trained = self.trainer.is_trained(module)
+            counts = self.trainer.get_sample_counts(module)
+            refs["badge"].configure(
+                text="Trained ✓" if trained else "Not trained",
+                text_color=COLOR_SAFE if trained else COLOR_WARNING,
+            )
+
+            parts = "  ·  ".join(
+                f"{label.replace('_', ' ')}: {count}" for label, count in counts.items()
+            )
+            if trained:
+                mtime = self.trainer.model_mtime(module)
+                if mtime:
+                    parts += f"  ·  last trained {datetime.fromtimestamp(mtime):%Y-%m-%d %H:%M}"
+            refs["detail"].configure(text=parts)
 
     def _open_training_guide(self) -> None:
         win = ctk.CTkToplevel(self)
@@ -405,21 +441,23 @@ class SettingsPanel(ctk.CTkFrame):
         ).pack(anchor="w", padx=PADDING, pady=(PADDING, 8))
 
         text = (
-            "1) Collect data\n"
-            "   - Capture clear photos/videos of students in your actual environment.\n"
-            "   - For UNIFORM: include correct vs wrong uniform examples.\n"
-            "   - For EARRING: include men with/without earrings.\n\n"
-            "2) Label your dataset\n"
-            "   - Organize images into folders per class label.\n"
-            "     uniform/: correct_uniform/, wrong_uniform/\n"
-            "     earring/: without_earring/, with_earring/\n\n"
-            "3) Train the classifier\n"
-            "   - Run the provided training scripts (earring/uniform).\n"
-            "   - Save checkpoints to the project's `models/` folder:\n"
-            "     `models/uniform_model.pth` and `models/earring_model.pth`\n\n"
-            "4) Restart CBVMS\n"
-            "   - Reopen the dashboard or click Refresh Status.\n"
-            "   - When loaded, the Model Status section will show “Loaded”.\n"
+            "Train classifiers directly inside CBVMS — no scripts or manual files needed.\n\n"
+            "1) Open the Training tab\n"
+            "   - Click 🎓 Training in the left sidebar.\n"
+            "   - Choose a tab: Uniform Check or Earring Check.\n\n"
+            "2) Build the dataset (per class)\n"
+            "   - UNIFORM: correct_uniform vs wrong_uniform.\n"
+            "   - EARRING: no_earring vs with_earring.\n"
+            "   - Use 'Upload Photos' or 'Capture from Camera' for each class.\n"
+            "   - Minimum 10 photos per class (more = better accuracy).\n\n"
+            "3) Train\n"
+            "   - Click 'Train Now'. A YOLOv8 classifier trains on your photos.\n"
+            "   - The model is saved automatically to the models/ folder\n"
+            "     (uniform_cls.pt / earring_cls.pt).\n\n"
+            "4) Check status\n"
+            "   - Return here and click 'Refresh Status'.\n"
+            "   - A trained model shows 'Trained ✓' with its sample counts\n"
+            "     and last-trained time.\n"
         )
         box = ctk.CTkTextbox(
             win,

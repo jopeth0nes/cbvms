@@ -29,10 +29,10 @@ class CBVMSLoginWindow(ctk.CTk):
     WIDTH = 420
     HEIGHT = 520
 
-    def __init__(self, auth_manager: AuthManager, on_success: Callable[[str], None]) -> None:
+    def __init__(self, auth_manager: AuthManager) -> None:
         super().__init__()
         self._auth = auth_manager
-        self._on_success = on_success
+        self.result_username: str | None = None
         self._password_visible = False
 
         apply_cbvms_theme()
@@ -173,17 +173,19 @@ class CBVMSLoginWindow(ctk.CTk):
 
         if self._auth.verify_login(username, password):
             self.error_label.configure(text="")
-            self.withdraw()
-            self._on_success(username)
+            self.result_username = username
             self.destroy()
             return
 
         self.error_label.configure(text="Invalid username or password.")
 
     def _on_close(self) -> None:
-        sys.exit(0)
+        self.result_username = None
+        self.destroy()
 
 
-def run_login(auth_manager: AuthManager, on_success: Callable[[str], None]) -> None:
-    app = CBVMSLoginWindow(auth_manager, on_success)
+def run_login(auth_manager: AuthManager) -> str | None:
+    """Show the login window; return the username on success, or None if closed."""
+    app = CBVMSLoginWindow(auth_manager)
     app.mainloop()
+    return app.result_username

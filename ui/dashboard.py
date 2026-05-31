@@ -16,10 +16,12 @@ import numpy as np
 
 from core.camera import CameraCapture
 from core.recognizer import FaceRecognizer
+from core.trainer import ViolationTrainer
 from database.db_manager import CBVMSDatabase
 from ui.camera_feed import CameraFeed
 from ui.enrollment import EnrollmentPanel
 from ui.settings import SettingsPanel
+from ui.training_panel import TrainingPanel
 from ui.violation_log import ViolationLogPanel
 from ui.components import (
     COLOR_ACCENT,
@@ -47,13 +49,15 @@ from ui.components import (
 
 FEED_FPS = 30
 MAX_ALERTS = 50
-PRESENCE_TIMEOUT_SECS = 10  # seconds absent from frame before next appearance triggers new alert
+PRESENCE_TIMEOUT_SECS = 30   # seconds absent from frame before re-appearance triggers UI alert
+DB_LOG_COOLDOWN_SECS   = 300 # 5-minute minimum between DB violation entries per person
 
 
 class CBVMSDashboard(ctk.CTk):
     def __init__(self, username: str = "admin") -> None:
         super().__init__()
         self.username = username
+        self._logout_requested = False
         self._active_nav = "live"
         self._alerts: deque[dict] = deque(maxlen=MAX_ALERTS)
         self._face_presence: dict[str, float] = {}   # identity_key → last_seen_epoch
@@ -75,12 +79,19 @@ class CBVMSDashboard(ctk.CTk):
         # Face recognizer (MTCNN + InceptionResnetV1) — lazy model load inside
         self._recognizer = FaceRecognizer(self._database)
 
+        # YOLOv8 classification trainer (uniform / earring modules)
+        self._trainer = ViolationTrainer()
+
         # Background face detection state
         self._face_detections: list[dict] = []
         self._face_frame_counter: int = 0
         self._face_queue: queue.Queue = queue.Queue(maxsize=1)
         self._face_worker = threading.Thread(target=self._face_worker_loop, daemon=True)
         self._face_worker.start()
+
+        # Separate DB-write cooldown (much longer than UI presence timeout)
+        # Prevents rapid re-logging of the same person making deletes appear to do nothing
+        self._db_log_cooldowns: dict[str, float] = {}  # identity_key → last_logged_epoch
 
         self._enrollment_panel: EnrollmentPanel | None = None
         self._violation_panel: ViolationLogPanel | None = None
@@ -145,6 +156,7 @@ class CBVMSDashboard(ctk.CTk):
             ("live",       "📹  Live Monitor"),
             ("enrollment", "👤  Student Enrollment"),
             ("violations", "⚠  Violation Log"),
+            ("training",   "🎓  Training"),
             ("settings",   "⚙  Settings"),
         ]
         self._nav_buttons: dict[str, ctk.CTkButton] = {}
@@ -262,6 +274,13 @@ class CBVMSDashboard(ctk.CTk):
         self._violation_panel = ViolationLogPanel(self._view_host, database=self._database)
         self._violation_panel.grid_remove()
 
+        self._training_panel = TrainingPanel(
+            self._view_host,
+            trainer=self._trainer,
+            get_frame=self._get_camera_frame,
+        )
+        self._training_panel.grid_remove()
+
         self._settings_panel = SettingsPanel(
             self._view_host,
             database=self._database,
@@ -271,6 +290,7 @@ class CBVMSDashboard(ctk.CTk):
             get_detector_loaded=lambda: False,
             apply_camera_settings=self._apply_camera_settings,
             on_camera_source_connected=self._on_camera_source_connected,
+            trainer=self._trainer,
         )
         self._settings_panel.grid_remove()
 
@@ -278,6 +298,7 @@ class CBVMSDashboard(ctk.CTk):
             "live":       self._live_frame,
             "enrollment": self._enrollment_panel,
             "violations": self._violation_panel,
+            "training":   self._training_panel,
             "settings":   self._settings_panel,
         }
         self._live_frame.grid(row=0, column=0, sticky="nsew")
@@ -390,6 +411,7 @@ class CBVMSDashboard(ctk.CTk):
             "live":       "Live Monitor",
             "enrollment": "Student Enrollment",
             "violations": "Violation Log",
+            "training":   "Training",
             "settings":   "Settings",
         }
         self._center_title.configure(text=titles.get(key, "CBVMS"))
@@ -407,40 +429,15 @@ class CBVMSDashboard(ctk.CTk):
         self._fade_transition(_switch_views)
 
     def _fade_transition(self, on_midpoint) -> None:
+        # Switch views immediately, then force window opacity back to fully opaque.
+        # The previous animated fade compounded transparency when navigations
+        # overlapped (it restored to the mid-fade alpha instead of 1.0), leaving
+        # the window progressively see-through. Always reset to 1.0.
+        on_midpoint()
         try:
-            original = float(self.attributes("-alpha") or 1.0)
+            self.attributes("-alpha", 1.0)
         except Exception:
-            on_midpoint()
-            return
-
-        steps = [1.0, 0.94, 0.90]
-
-        def _fade_out(i: int = 0) -> None:
-            if i >= len(steps):
-                on_midpoint()
-                self.after(0, _fade_in, len(steps) - 1)
-                return
-            try:
-                self.attributes("-alpha", steps[i])
-            except Exception:
-                on_midpoint()
-                return
-            self.after(18, _fade_out, i + 1)
-
-        def _fade_in(i: int) -> None:
-            if i < 0:
-                try:
-                    self.attributes("-alpha", original)
-                except Exception:
-                    pass
-                return
-            try:
-                self.attributes("-alpha", steps[i])
-            except Exception:
-                return
-            self.after(18, _fade_in, i - 1)
-
-        _fade_out(0)
+            pass
 
     # ------------------------------------------------------------------
     # Camera preferences
@@ -570,13 +567,13 @@ class CBVMSDashboard(ctk.CTk):
                 frame = self._face_queue.get(timeout=1.0)
                 detections = self._recognizer.recognize_faces(frame)
                 if self.winfo_exists():
-                    self.after(0, self._on_detections_ready, detections)
+                    self.after(0, self._on_detections_ready, detections, frame)
             except queue.Empty:
                 pass
             except Exception as exc:
                 print(f"[CBVMS] face worker error: {exc}")
 
-    def _on_detections_ready(self, detections: list[dict]) -> None:
+    def _on_detections_ready(self, detections: list[dict], frame: np.ndarray | None = None) -> None:
         """UI-thread callback: update annotation state and fire presence-based alerts.
 
         One alert fires when a face first appears. While the face stays in frame,
@@ -597,7 +594,7 @@ class CBVMSDashboard(ctk.CTk):
             self._face_presence[key] = now   # always refresh last-seen timestamp
 
             if is_new_appearance:
-                self._push_alert(det)
+                self._push_alert(det, frame)
 
         # Remove identities that have left the frame long enough
         stale = [
@@ -607,8 +604,43 @@ class CBVMSDashboard(ctk.CTk):
         for k in stale:
             del self._face_presence[k]
 
-    def _push_alert(self, det: dict) -> None:
-        """Add one alert card for a detected face."""
+    def _push_alert(self, det: dict, frame: np.ndarray | None = None) -> None:
+        """Add one alert card and persist to the violations table."""
+        # Crop face snapshot
+        snapshot_jpeg: bytes | None = None
+        if frame is not None:
+            try:
+                x1, y1, x2, y2 = [int(v) for v in det["box"]]
+                h, w = frame.shape[:2]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w, x2), min(h, y2)
+                crop = frame[y1:y2, x1:x2] if (x2 > x1 and y2 > y1) else frame
+                ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                if ok:
+                    snapshot_jpeg = buf.tobytes()
+            except Exception:
+                pass
+
+        # Persist to violations table — throttled by DB_LOG_COOLDOWN_SECS (default 5 min)
+        # This prevents rapid re-logging of the same person which would make
+        # deleted records appear to immediately reappear.
+        db_key = det["student_id"] or "unknown"
+        now_ts = time.time()
+        last_logged = self._db_log_cooldowns.get(db_key, 0.0)
+        if now_ts - last_logged >= DB_LOG_COOLDOWN_SECS:
+            self._db_log_cooldowns[db_key] = now_ts
+            violation_type = "face_detected" if det["matched"] else "unknown_person"
+            try:
+                self._database.log_violation(
+                    student_id=db_key,
+                    student_name=det["name"],
+                    violation_type=violation_type,
+                    snapshot_jpeg=snapshot_jpeg,
+                )
+            except Exception as exc:
+                print(f"[CBVMS] log_violation error: {exc}")
+
+        # Update live alerts panel (in-memory card)
         entry = {
             "identity_key": det["student_id"] or "unknown",
             "name": det["name"],
@@ -620,6 +652,10 @@ class CBVMSDashboard(ctk.CTk):
         }
         self._alerts.appendleft(entry)
         self._refresh_alerts_ui()
+
+        # Refresh violation log panel if it's open
+        if self._active_nav == "violations" and self._violation_panel is not None:
+            self._violation_panel.refresh()
 
     def _annotate_frame(self, frame: np.ndarray) -> np.ndarray:
         """Draw face detection boxes + names onto a copy of the frame."""
@@ -730,6 +766,7 @@ class CBVMSDashboard(ctk.CTk):
     def _clear_alerts(self) -> None:
         self._alerts.clear()
         self._face_presence.clear()
+        self._db_log_cooldowns.clear()   # reset so next detection logs fresh
         self._refresh_alerts_ui()
 
     def _refresh_alerts_ui(self) -> None:
@@ -800,8 +837,8 @@ class CBVMSDashboard(ctk.CTk):
     # ------------------------------------------------------------------
 
     def _logout(self) -> None:
+        self._logout_requested = True
         self._on_close()
-        sys.exit(0)
 
     def _on_close(self) -> None:
         for job_attr in ("_feed_job", "_clock_job", "_stats_job"):
@@ -817,6 +854,8 @@ class CBVMSDashboard(ctk.CTk):
         self.destroy()
 
 
-def open_dashboard(username: str = "admin") -> None:
+def open_dashboard(username: str = "admin") -> bool:
+    """Run the dashboard. Returns True if the user logged out (vs. closed the app)."""
     app = CBVMSDashboard(username=username)
     app.mainloop()
+    return getattr(app, "_logout_requested", False)

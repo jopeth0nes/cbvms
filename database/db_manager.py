@@ -123,7 +123,17 @@ class CBVMSDatabase:
             conn.commit()
             return int(cursor.lastrowid)
 
+    def update_student_encoding(self, student_pk: int, encoding: bytes, photo: bytes) -> bool:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "UPDATE students SET encoding = ?, photo = ? WHERE id = ?",
+                (encoding, photo, student_pk),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
     def delete_student(self, student_pk: int) -> bool:
+
         with self.connect() as conn:
             cursor = conn.execute("DELETE FROM students WHERE id = ?", (student_pk,))
             conn.commit()
@@ -158,3 +168,27 @@ class CBVMSDatabase:
             )
             conn.commit()
             return int(cursor.lastrowid)
+
+    def delete_violation(self, violation_id: int) -> bool:
+        with self.connect() as conn:
+            cursor = conn.execute("DELETE FROM violations WHERE id = ?", (violation_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_violations(self, violation_ids: list[int]) -> int:
+        if not violation_ids:
+            return 0
+        placeholders = ",".join("?" for _ in violation_ids)
+        with self.connect() as conn:
+            cursor = conn.execute(
+                f"DELETE FROM violations WHERE id IN ({placeholders})", violation_ids
+            )
+            conn.commit()
+            return cursor.rowcount
+
+    def delete_all_violations(self, where: str = "", params: list | None = None) -> int:
+        sql = f"DELETE FROM violations {where}"
+        with self.connect() as conn:
+            cursor = conn.execute(sql, params or [])
+            conn.commit()
+            return cursor.rowcount
