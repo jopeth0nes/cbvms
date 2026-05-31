@@ -785,6 +785,11 @@ class EnrollmentPanel(ctk.CTkFrame):
             modal.destroy()
 
         def _finish(frames) -> None:
+            # The modal may have been cancelled during the ~1s frame capture
+            # (_collect_frames only guards the panel, not this modal).
+            if not modal.winfo_exists():
+                return
+
             def _retry(msg: str) -> None:
                 status_lbl.configure(text=msg, text_color=COLOR_DANGER)
                 if capture_btn.winfo_exists():
